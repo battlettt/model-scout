@@ -15,7 +15,8 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - All asset paths are relative, so the app also works served from a subpath (e.g. battlettt.github.io/model-scout/).
 
 ## Test
-- `node tests/run_tests.js` (ranking math, cost math, stale-data flagging, catalog validation).
+- `node tests/run_tests.js` (ranking math, cost math, stale-data flagging, catalog validation, UI static checks: IDs, assets, labels, contrast, motion).
+- DOM smoke tests (`tests/dom_smoke.js`) run from the same command when jsdom is on the module path (`NODE_PATH=.../node_modules`); otherwise they are skipped.
 - Every catalog entry must have a source + date or be flagged.
 - `node --check` every JS file. No browser in CI: tests cover the engine, catalog, and static checks.
 

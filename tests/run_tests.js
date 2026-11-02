@@ -415,5 +415,271 @@ test("no secrets or API keys in the repo files", function () {
 });
 
 // ------------------------------------------------------------------
+section("UI: structure, assets, accessibility (static, no browser)");
+var appJs = fs.readFileSync(path.join(ROOT, "app.js"), "utf8");
+var css = fs.readFileSync(path.join(ROOT, "styles.css"), "utf8");
+var pageHtml = html.replace(/<script type="application\/json" id="embedded-catalog">[\s\S]*?<\/script>/, "");
+function htmlIds() {
+  var ids = {}, re = /\sid="([^"]+)"/g, m;
+  while ((m = re.exec(html))) ids[m[1]] = (ids[m[1]] || 0) + 1;
+  return ids;
+}
+function jsIds() {
+  // $("id"), tokens("id"), getElementById("id"), and the "<field>-error" helpers built in validateFields
+  var out = {}, re = /(?:\$|tokens|getElementById)\("([a-z][a-z0-9-]*)"\)/g, m;
+  while ((m = re.exec(appJs))) out[m[1]] = true;
+  var vf = appJs.match(/function validateFields\(\)[\s\S]*?\n  \}/);
+  assert.ok(vf, "validateFields not found");
+  (vf[0].match(/\["([a-z-]+)", "/g) || []).forEach(function (s) { var id = s.slice(2, -4); out[id] = true; out[id + "-error"] = true; });
+  return Object.keys(out);
+}
+function controls() {
+  var list = [], re = /<(input|select|textarea)\b([^>]*)>/g, m;
+  while ((m = re.exec(pageHtml))) {
+    var id = (m[2].match(/\sid="([^"]+)"/) || [])[1];
+    list.push({ tag: m[1], id: id, attrs: m[2] });
+  }
+  return list;
+}
+
+test("every element ID used by app.js exists exactly once in index.html", function () {
+  var ids = htmlIds(), used = jsIds();
+  assert.ok(used.length >= 25, "expected to find the app.js IDs, found " + used.length);
+  used.forEach(function (id) {
+    assert.ok(ids[id], "missing id in index.html: " + id);
+    assert.strictEqual(ids[id], 1, "duplicate id: " + id);
+  });
+});
+test("no duplicate IDs anywhere in index.html", function () {
+  var ids = htmlIds();
+  Object.keys(ids).forEach(function (id) { assert.strictEqual(ids[id], 1, "duplicate id: " + id); });
+});
+test("every profile field from v1 is still in the form", function () {
+  var form = pageHtml.match(/<form id="profile"[\s\S]*?<\/form>/);
+  assert.ok(form, "form#profile missing");
+  ["task-desc", "suggest", "task-type", "budget", "latency", "quality", "context-need", "modality", "local-only", "vol-in", "vol-out"]
+    .forEach(function (id) { assert.ok(form[0].indexOf('id="' + id + '"') >= 0, id + " not inside the form"); });
+  assert.ok(/id="context-need"[\s\S]*?value="32000" selected/.test(form[0]), "32K default lost");
+  assert.ok(/id="vol-in"[^>]*value="50"/.test(form[0]) && /id="vol-out"[^>]*value="10"/.test(form[0]), "volume defaults lost");
+});
+test("every relative asset reference resolves to a file in the repo", function () {
+  var re = /\b(?:src|href)\s*=\s*"([^"#][^"]*)"/g, m, n = 0;
+  while ((m = re.exec(html))) {
+    var ref = m[1].split(/[?#]/)[0];
+    assert.ok(!/^\/|^[a-z]+:/i.test(ref), "absolute or external path: " + ref);
+    assert.ok(fs.existsSync(path.join(ROOT, ref)), "broken asset reference: " + ref);
+    n++;
+  }
+  assert.ok(n >= 2);
+  assert.ok(!/url\(/.test(css), "styles.css must not reference files");
+});
+test("every in-page link points at an element that exists", function () {
+  var ids = htmlIds(), re = /href="#([^"]+)"/g, m;
+  while ((m = re.exec(pageHtml))) assert.ok(ids[m[1]], "dead in-page link: #" + m[1]);
+  assert.ok(/href="#card-'/.test(appJs), "table rows link to their cards");
+  assert.ok(/id="card-'/.test(appJs), "cards carry the matching id");
+});
+test("every form control has a visible label (label for=id)", function () {
+  var list = controls();
+  assert.ok(list.length >= 12, "expected at least 12 controls, found " + list.length);
+  list.forEach(function (c) {
+    assert.ok(c.id, c.tag + " without an id");
+    var re = new RegExp('<label[^>]*\\sfor="' + c.id + '"[^>]*>([\\s\\S]*?)</label>');
+    var lm = pageHtml.match(re);
+    assert.ok(lm, "no label for #" + c.id);
+    assert.ok(lm[1].replace(/<[^>]+>/g, "").trim().length > 3, "empty label for #" + c.id);
+  });
+});
+test("aria-describedby targets exist (helper text and inline errors)", function () {
+  var ids = htmlIds(), re = /aria-describedby="([^"]+)"/g, m, n = 0;
+  while ((m = re.exec(pageHtml))) m[1].split(/\s+/).forEach(function (id) { n++; assert.ok(ids[id], "missing describedby target: " + id); });
+  assert.ok(n >= 6);
+  ["budget", "vol-in", "vol-out"].forEach(function (id) {
+    assert.ok(new RegExp('id="' + id + '"[^>]*aria-describedby="[^"]*' + id + '-error').test(pageHtml), id + " error not tied to its field");
+  });
+});
+test("buttons have text labels, not icons only", function () {
+  var re = /<button\b[^>]*>([\s\S]*?)<\/button>/g, m, n = 0;
+  while ((m = re.exec(pageHtml))) { n++; assert.ok(m[1].replace(/<[^>]+>/g, "").trim().length > 3, "button without text"); }
+  assert.ok(n >= 1);
+});
+test("skip link is the first element in body and targets the results section", function () {
+  var body = pageHtml.split(/<body[^>]*>/)[1].trim();
+  assert.ok(/^<a class="skip" href="#results">Skip to results<\/a>/.test(body), "skip link must come first");
+  assert.ok(/<section id="results"[^>]*tabindex="-1"/.test(pageHtml), "results should accept focus from the skip link");
+  assert.ok(/\.skip:focus\s*\{[^}]*translateY\(0\)/.test(css), "skip link must become visible on focus");
+});
+test("zoom is never disabled and the page declares light and dark", function () {
+  var vp = pageHtml.match(/<meta name="viewport" content="([^"]+)"/);
+  assert.ok(vp && /width=device-width/.test(vp[1]));
+  assert.ok(!/user-scalable\s*=\s*no|maximum-scale/i.test(vp[1]), "zoom disabled");
+  assert.ok(/<html lang="en">/.test(pageHtml));
+  assert.ok(/@media \(prefers-color-scheme: dark\)/.test(css), "dark mode dropped");
+});
+test("focus rings are visible and never removed without a replacement", function () {
+  assert.ok(/:focus-visible\s*\{\s*outline:\s*3px solid var\(--focus\)/.test(css), "global focus-visible ring missing");
+  var re = /([^{}]+)\{([^}]*outline:\s*(?:none|0)\b[^}]*)\}/g, m;
+  while ((m = re.exec(css))) {
+    var sel = m[1].trim();
+    assert.ok(/:focus\b/.test(sel) && !/focus-visible/.test(sel), "outline removed on: " + sel);
+    var visible = sel.replace(/:focus\b/, ":focus-visible");
+    assert.ok(css.indexOf(visible) >= 0, "no focus-visible replacement for " + sel);
+  }
+});
+test("touch targets: buttons, inputs, selects, nav links, and checkbox labels are at least 44px tall", function () {
+  [/\.btn, button \{[^}]*min-height: 44px/, /input\[type="number"\], select, textarea \{[^}]*min-height: 44px/,
+   /\.sections a \{[^}]*min-height: 44px/, /\.check label \{[^}]*min-height: 44px/, /\.disclose summary \{[^}]*min-height: 44px/,
+   /\.skip \{[^}]*min-height: 44px/].forEach(function (re) { assert.ok(re.test(css), "missing 44px target: " + re); });
+});
+test("colors are semantic tokens: no raw hex outside the two :root token blocks", function () {
+  var blocks = css.match(/:root \{[^}]*\}/g) || [];
+  assert.ok(blocks.length >= 3, "token blocks missing");
+  var rest = css;
+  blocks.forEach(function (b) { rest = rest.replace(b, ""); });
+  var hex = rest.match(/#[0-9a-fA-F]{3,8}\b/g) || [];
+  assert.deepStrictEqual(hex, [], "raw hex outside tokens");
+  assert.ok(!/rgba?\(/.test(rest), "raw rgb outside tokens");
+  assert.ok(!/gradient\(/.test(css), "no decorative gradients");
+});
+
+// WCAG contrast from the token blocks, both modes.
+function tokens(block) {
+  var t = {}, re = /--([a-z0-9-]+):\s*(#[0-9a-fA-F]{6})/g, m;
+  while ((m = re.exec(block))) t[m[1]] = m[2];
+  return t;
+}
+function lum(hex) {
+  var c = [1, 3, 5].map(function (i) {
+    var v = parseInt(hex.substr(i, 2), 16) / 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+function contrast(a, b) { var x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
+var lightTokens = tokens(css.match(/^:root \{[^}]*\}/m)[0]);
+var darkTokens = tokens(css.match(/prefers-color-scheme: dark\)\s*\{\s*:root \{[^}]*\}/)[0]);
+var TEXT_PAIRS = [
+  ["text", "bg"], ["text", "surface"], ["text", "surface-2"], ["text", "accent-soft"],
+  ["muted", "bg"], ["muted", "surface"], ["muted", "surface-2"], ["muted", "accent-soft"],
+  ["accent-text", "bg"], ["accent-text", "surface"], ["accent-text", "accent-soft"],
+  ["on-accent", "accent"], ["on-accent", "accent-hover"],
+  ["ok", "ok-soft"], ["warn", "warn-soft"], ["warn", "surface"], ["warn", "bg"], ["live", "live-soft"]
+];
+[["light", lightTokens], ["dark", darkTokens]].forEach(function (mode) {
+  test("text contrast is at least 4.5:1 in " + mode[0] + " mode", function () {
+    TEXT_PAIRS.forEach(function (pr) {
+      var t = mode[1];
+      assert.ok(t[pr[0]] && t[pr[1]], "token missing: " + pr.join(" / "));
+      var r = contrast(t[pr[0]], t[pr[1]]);
+      assert.ok(r >= 4.5, pr[0] + " on " + pr[1] + " is " + r.toFixed(2) + ":1");
+    });
+  });
+  test("focus ring and accent border are at least 3:1 against the page in " + mode[0] + " mode", function () {
+    var t = mode[1];
+    ["bg", "surface"].forEach(function (b) {
+      assert.ok(contrast(t.focus, t[b]) >= 3, "focus on " + b);
+      assert.ok(contrast(t.accent, t[b]) >= 3, "accent on " + b);
+    });
+  });
+});
+
+test("type scale: base 16px with 1.5 line height, nothing below 12px", function () {
+  assert.ok(/body \{[^}]*font-size: 1rem;[^}]*line-height: 1\.5;/.test(css));
+  var re = /font-size:\s*([0-9.]+)(rem|px|em)\b/g, m;
+  while ((m = re.exec(css))) {
+    var px = m[2] === "px" ? parseFloat(m[1]) : parseFloat(m[1]) * 16;
+    if (m[2] === "em" && parseFloat(m[1]) < 1) continue; // relative to a larger heading (section numbers)
+    assert.ok(px >= 12, "font-size under 12px: " + m[0]);
+  }
+});
+test("system font stacks only: serif headings, sans UI, mono figures with tabular numbers", function () {
+  assert.ok(!/@font-face|@import/.test(css));
+  assert.ok(/--font-serif:[^;]*serif;/.test(css) && /--font-sans:[^;]*system-ui/.test(css) && /--font-mono:[^;]*monospace;/.test(css));
+  assert.ok(/h1, h2, h3 \{[^}]*font-family: var\(--font-serif\)/.test(css));
+  assert.ok(/\.figure-value \{[^}]*font-variant-numeric: tabular-nums/.test(css));
+});
+test("motion: reduced-motion respected, width and height never animated, durations vary", function () {
+  assert.ok(/@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*animation: none !important/.test(css));
+  (css.match(/transition(?:-property)?:[^;]*;/g) || []).forEach(function (t) {
+    assert.ok(!/\b(width|height|all)\b/.test(t), "animates layout: " + t);
+  });
+  (css.match(/@keyframes[^{]+\{[\s\S]*?\}\s*\}/g) || []).forEach(function (k) {
+    assert.ok(!/\b(width|height)\s*:/.test(k), "keyframes animate size: " + k);
+  });
+  var durations = {};
+  (css.match(/--t-[a-z]+:\s*\d+ms/g) || []).forEach(function (d) { durations[d.split(":")[1].trim()] = true; });
+  assert.ok(Object.keys(durations).length >= 3, "use different durations for different changes");
+  assert.ok(/state\.lastOrder/.test(appJs), "reveal only when the ranking order changes");
+});
+test("responsive: no fixed pixel container widths, table stacks into cards on narrow screens", function () {
+  assert.ok(!/(?:^|[^-])width:\s*\d{3,}px/m.test(css), "fixed pixel width");
+  assert.ok(/\.wrap \{[^}]*max-width: [0-9.]+rem/.test(css));
+  var stack = css.match(/@media \(max-width: 59\.99em\) \{[\s\S]*?\n\}/);
+  assert.ok(stack, "narrow-screen table rule missing");
+  assert.ok(/table\.compare, \.compare tbody, \.compare tr, \.compare td/.test(stack[0]) && /display: block/.test(stack[0]));
+  assert.ok(/content: attr\(data-label\)/.test(stack[0]), "stacked cells must show their column name");
+  assert.ok(/\.table-wrap \{ overflow: visible/.test(stack[0]), "no sideways scroll on phones");
+});
+test("every comparison column has a data-label that matches the table header", function () {
+  var heads = (pageHtml.match(/<thead>[\s\S]*?<\/thead>/)[0].match(/<th scope="col">([^<]+)<\/th>/g) || [])
+    .map(function (h) { return h.replace(/<[^>]+>/g, ""); });
+  assert.strictEqual(heads.length, 12);
+  var cols = appJs.match(/var COLUMNS = (\[[^\]]+\]);/);
+  assert.ok(cols, "COLUMNS missing");
+  assert.deepStrictEqual(JSON.parse(cols[1]), heads);
+  var tdCalls = appJs.match(/td\(\d+,/g) || [];
+  assert.ok(tdCalls.length >= 6, "cells built through td()");
+});
+test("loading, empty, and error states exist in the markup and the UI code", function () {
+  assert.ok(/id="data-status"[^>]*data-state="loading"/.test(pageHtml), "status starts in loading state");
+  assert.ok(/id="top-pick"[^>]*aria-busy="true"/.test(pageHtml), "top pick starts busy");
+  assert.ok(/<tbody id="compare-body">\s*<tr class="placeholder">/.test(pageHtml), "table reserves a loading row");
+  assert.ok(/\.top-pick \{[^}]*min-height:/.test(css) && /\.status \{[^}]*min-height:/.test(css), "space reserved");
+  assert.ok(/No model fits every hard constraint/.test(appJs) && /cards-empty/.test(appJs) && /empty-row/.test(appJs));
+  assert.ok(/data-state", "error"/.test(appJs) && /"offline"/.test(appJs));
+});
+test("winner treatment: best pick marker on the headline, table row, and card", function () {
+  assert.ok(/var BEST_FLAG = '<span class="best-flag">/.test(appJs) && /Best pick<\/span>'/.test(appJs));
+  assert.ok(/pick-tag">Best pick</.test(appJs));
+  assert.ok(/\.card\.is-top \{[^}]*border: 2px solid var\(--accent\)/.test(css));
+  assert.ok(/\.top-pick \{[^}]*border: 2px solid var\(--accent\)/.test(css));
+  assert.ok(/<svg[^>]*aria-hidden="true"/.test(appJs), "decorative icon hidden from screen readers");
+});
+test("honesty copy is still on the page", function () {
+  ["editorial estimates", "not benchmark scores", "bundled catalog", "* means that figure is not verified", "says so at the top",
+   "not reviewed: quality and speed not rated"].forEach(function (s) { assert.ok(pageHtml.indexOf(s) >= 0, "missing: " + s); });
+  ["Stale", "Offline", "Live data unavailable", "Using the bundled catalog dated", "Partly unverified"].forEach(function (s) {
+    assert.ok(appJs.indexOf(s) >= 0, "app.js lost: " + s);
+  });
+});
+test("no emoji used as icons in the page or the UI code", function () {
+  var re = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B50}\u{2705}]/u;
+  assert.ok(!re.test(pageHtml), "emoji in index.html");
+  assert.ok(!re.test(appJs), "emoji in app.js");
+});
+test("app.js keeps the engine-then-UI layout (engine exported before any DOM code)", function () {
+  var exp = appJs.indexOf("module.exports = api"), dom = appJs.indexOf("document.getElementById");
+  assert.ok(exp > 0 && dom > exp, "engine export must come before browser UI");
+  assert.ok(/if \(typeof document === "undefined"\) return;/.test(appJs));
+});
+
+// ------------------------------------------------------------------
+// DOM smoke tests run in a child process (they are async and need jsdom, which is optional).
+section("DOM smoke tests (jsdom, see tests/dom_smoke.js)");
+(function () {
+  var r = require("child_process").spawnSync(process.execPath, [path.join(__dirname, "dom_smoke.js")], { encoding: "utf8", env: process.env, timeout: 120000 });
+  var out = (r.stdout || "") + (r.stderr || "");
+  if (/^SKIP/m.test(out)) { console.log("  skip jsdom not installed (set NODE_PATH to a node_modules with jsdom to run them)"); return; }
+  out.split("\n").filter(function (l) { return /^ {2}(ok|FAIL)| {7}/.test(l); }).forEach(function (l) { console.log(l); });
+  var m = out.match(/(\d+) passed, (\d+) failed/);
+  if (!m || r.status !== 0) {
+    var failed = m ? parseInt(m[2], 10) : 1;
+    results.fail += failed;
+    results.failures.push("DOM smoke: " + (m ? failed + " failed" : "did not finish: " + out.slice(-300)));
+  }
+  if (m) results.pass += parseInt(m[1], 10);
+})();
+
+// ------------------------------------------------------------------
 console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");
 if (results.fail) { console.log(results.failures.join("\n")); process.exit(1); }
