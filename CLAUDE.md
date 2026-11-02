@@ -17,6 +17,20 @@ Interactive website that researches LLMs and recommends the right model for a ta
 ## Test
 - `node tests/run_tests.js` (ranking math, cost math, stale-data flagging, catalog validation).
 - Every catalog entry must have a source + date or be flagged.
+- `node --check` every JS file. No browser in CI: tests cover the engine, catalog, and static checks.
+
+## Layout
+- `index.html`, `styles.css`, `app.js`, `catalog.json` at the repo root are the whole app (deploy these four).
+- `app.js`: pure engine (weights, scoring, cost, staleness, validation, live merge, switch check) exported for node, then browser UI.
+- `index.html` embeds a copy of `catalog.json` for `file://` use. After editing the catalog run `node tests/sync_embedded_catalog.js`; a test fails if they drift.
+- `AGENTS.md` is a symlink to this file (git mode 120000). Do not replace it with a regular file.
+
+## Data rules
+- Stale = `last_verified` missing, invalid, future, or older than 90 days (`STALE_AFTER_DAYS` in app.js, `stale_after_days` in catalog.json).
+- Prices are USD per million tokens; null only with `price_status: "unverified"`. Field-level doubts go in `unverified_fields`.
+- `quality_tier` and `latency_class` are editorial, from provider positioning. Never add benchmark numbers.
+- Live data: browser fetches https://openrouter.ai/api/v1/models (no key). On failure, fall back to the bundled catalog and say so.
+- User-facing copy: no em dashes.
 
 ## Conventions
 - No build step. Plain HTML, CSS, JavaScript.
