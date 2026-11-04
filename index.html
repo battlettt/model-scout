@@ -18,9 +18,10 @@
       <nav class="sections" aria-label="Sections">
         <a href="#profile-section"><span class="nav-num">1</span> Task profile</a>
         <a href="#results"><span class="nav-num">2</span> Results</a>
-        <a href="#playbook"><span class="nav-num">3</span> What to use when</a>
-        <a href="#switch"><span class="nav-num">4</span> Switch triggers</a>
-        <a href="#about"><span class="nav-num">5</span> About the data</a>
+        <a href="#chat"><span class="nav-num">3</span> Ask a model</a>
+        <a href="#playbook"><span class="nav-num">4</span> What to use when</a>
+        <a href="#switch"><span class="nav-num">5</span> Switch triggers</a>
+        <a href="#about"><span class="nav-num">6</span> About the data</a>
       </nav>
     </div>
   </header>
@@ -203,9 +204,129 @@
       <ul id="excluded" class="excluded"></ul>
     </section>
 
+    <section id="chat" class="block" aria-labelledby="chat-h" tabindex="-1">
+      <div class="block-head">
+        <h2 id="chat-h"><span class="sec-num">3.</span> Ask a model</h2>
+        <p class="block-lede">Try a model on your own question before you commit to it. Chat with one model, or send one question to two models and read the answers side by side. Uses your own OpenRouter key, or a local Ollama model with no key.</p>
+      </div>
+      <div class="chat-layout">
+        <div class="chat-settings panel">
+          <h3>Connection</h3>
+          <fieldset class="seg-group">
+            <legend>Provider</legend>
+            <div class="seg">
+              <input type="radio" name="chat-provider" id="chat-provider-openrouter" value="openrouter" checked>
+              <label for="chat-provider-openrouter">OpenRouter</label>
+              <input type="radio" name="chat-provider" id="chat-provider-local" value="local">
+              <label for="chat-provider-local">Local Ollama</label>
+            </div>
+          </fieldset>
+
+          <div id="chat-key-box">
+            <form id="chat-key-form" class="key-box" novalidate>
+              <div class="field">
+                <label for="chat-key">Your OpenRouter API key</label>
+                <input id="chat-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your key here" aria-describedby="chat-key-warning chat-key-status chat-key-error">
+                <p id="chat-key-warning" class="key-warning">Your key lives in this browser only (local storage), never in Model Scout's code. It goes only to openrouter.ai, in the Authorization header, when you press Send. Anyone using this browser profile can read it: press Forget key on a shared computer.</p>
+                <p id="chat-key-status" class="key-status" aria-live="polite">No key saved yet.</p>
+                <p id="chat-key-error" class="field-error" aria-live="polite"></p>
+              </div>
+              <div class="row">
+                <button type="submit" id="chat-key-save" class="btn">Save key</button>
+                <button type="button" id="chat-key-forget" class="btn">Forget key</button>
+              </div>
+              <small class="key-help">No key yet? Create one at openrouter.ai/keys. Every message is billed to your OpenRouter account at that model's price.</small>
+            </form>
+          </div>
+
+          <div id="chat-local-note" class="local-note" hidden>
+            <p><strong>Local Ollama</strong> sends your messages to Ollama on this computer (localhost, port 11434) with the dolphin3 model. No key is needed and nothing leaves your machine.</p>
+            <p>It only works when Model Scout is served from localhost, for example with <code>python3 -m http.server 8000</code> and then opening localhost:8000. The public https site cannot call http://localhost, so local mode fails there.</p>
+            <p>Before you start, run <code>ollama pull dolphin3</code> and keep Ollama running.</p>
+            <p id="chat-local-check" class="verdict warn" aria-live="polite">Checking where this page is served from...</p>
+          </div>
+
+          <div class="check stream-check">
+            <input id="chat-stream" type="checkbox" aria-describedby="chat-stream-help">
+            <label for="chat-stream">Stream answers as they are written</label>
+            <small id="chat-stream-help">Off by default. If answers stop partway, turn it off and send again.</small>
+          </div>
+        </div>
+
+        <div id="chat-main" class="chat-main panel">
+          <fieldset class="seg-group">
+            <legend>Mode</legend>
+            <div class="seg">
+              <input type="radio" name="chat-mode" id="chat-mode-single" value="single" checked>
+              <label for="chat-mode-single">Single model</label>
+              <input type="radio" name="chat-mode" id="chat-mode-side" value="side">
+              <label for="chat-mode-side">Side by side</label>
+            </div>
+          </fieldset>
+          <p id="chat-status" class="chat-status" aria-live="polite"></p>
+
+          <div id="chat-single" class="chat-pane">
+            <div class="field">
+              <label for="chat-model">Model</label>
+              <select id="chat-model" aria-describedby="chat-model-note">
+                <option value="cognitivecomputations/dolphin-mistral-24b-venice-edition" selected>Venice Uncensored</option>
+                <option value="nousresearch/hermes-3-llama-3.1-70b">Nous Hermes 3 70B</option>
+              </select>
+              <small id="chat-model-note">OpenRouter model id: cognitivecomputations/dolphin-mistral-24b-venice-edition.</small>
+            </div>
+            <div id="chat-log" class="chat-log" role="log" aria-live="polite" aria-label="Conversation" tabindex="0">
+              <p class="chat-empty">No messages yet.</p>
+            </div>
+            <form id="chat-form" class="chat-form" novalidate>
+              <div class="field">
+                <label for="chat-input">Your message</label>
+                <textarea id="chat-input" rows="3" aria-describedby="chat-input-help"></textarea>
+                <small id="chat-input-help">Enter sends. Shift+Enter starts a new line.</small>
+              </div>
+              <div class="row">
+                <button type="submit" id="chat-send" class="btn primary">Send</button>
+                <button type="button" id="chat-clear" class="btn">Clear conversation</button>
+              </div>
+            </form>
+          </div>
+
+          <div id="chat-side" class="chat-pane" hidden>
+            <form id="side-form" novalidate>
+              <div class="side-pickers">
+                <div class="field">
+                  <label for="side-model-a">Left model</label>
+                  <select id="side-model-a"><option value="">Choose a model</option></select>
+                </div>
+                <div class="field">
+                  <label for="side-model-b">Right model</label>
+                  <select id="side-model-b"><option value="">Choose a model</option></select>
+                </div>
+              </div>
+              <div class="field">
+                <label for="side-input">Your question</label>
+                <textarea id="side-input" rows="3" aria-describedby="side-input-help"></textarea>
+                <small id="side-input-help">Both models get the same question at the same time. Each column finishes or fails on its own. Ask this model on any card fills the first empty column, or the left one if both are set.</small>
+              </div>
+              <button type="submit" id="side-send" class="btn primary">Send to both</button>
+            </form>
+            <div id="side-cols" class="side-cols">
+              <article id="side-col-a" class="side-col" data-status="idle" aria-live="polite" aria-label="Left answer">
+                <header class="side-head"><p class="eyebrow">Left</p><h3 class="side-name">No model chosen</h3><span class="badge idle">Ready</span></header>
+                <div class="side-body"><p class="muted">The answer appears here.</p></div>
+              </article>
+              <article id="side-col-b" class="side-col" data-status="idle" aria-live="polite" aria-label="Right answer">
+                <header class="side-head"><p class="eyebrow">Right</p><h3 class="side-name">No model chosen</h3><span class="badge idle">Ready</span></header>
+                <div class="side-body"><p class="muted">The answer appears here.</p></div>
+              </article>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="playbook" class="block" aria-labelledby="playbook-h">
       <div class="block-head">
-        <h2 id="playbook-h"><span class="sec-num">3.</span> What to use when</h2>
+        <h2 id="playbook-h"><span class="sec-num">4.</span> What to use when</h2>
         <p class="block-lede">Rules you can apply without the ranker. Start at the top and stop at the first rule that matches.</p>
       </div>
       <ol class="rules numbered">
@@ -223,7 +344,7 @@
 
     <section id="switch" class="block" aria-labelledby="switch-h">
       <div class="block-head">
-        <h2 id="switch-h"><span class="sec-num">4.</span> Switch triggers: when to reconsider your pick</h2>
+        <h2 id="switch-h"><span class="sec-num">5.</span> Switch triggers: when to reconsider your pick</h2>
       </div>
       <div class="switch-layout">
         <ul class="rules ticks">
@@ -246,7 +367,7 @@
 
     <section id="about" class="block" aria-labelledby="about-h">
       <div class="block-head">
-        <h2 id="about-h"><span class="sec-num">5.</span> About the data, and what this app does not do</h2>
+        <h2 id="about-h"><span class="sec-num">6.</span> About the data, and what this app does not do</h2>
       </div>
       <ul class="rules ticks about">
         <li>The bundled catalog is dated <strong id="catalog-date">(loading)</strong>. Prices and context windows for most models come from OpenRouter's public model list on that date. Buying direct from a provider can cost a different amount.</li>
@@ -254,7 +375,8 @@
         <li>A spec counts as stale when its verification date is missing or older than 90 days. Stale and unverified figures are labelled on every card.</li>
         <li><strong>Quality tiers and speed classes are editorial estimates</strong> from each provider's own positioning of the model (flagship, mid-tier, small). They are not benchmark scores. Model Scout does not publish benchmark numbers.</li>
         <li>For open-weight models the listed price is what a hosting provider charges. Running the model yourself has no per-token fee, but you pay for hardware and power, which this app does not estimate.</li>
-        <li>Model Scout runs entirely in your browser. It does not call any model, has no accounts, no server, and no tracking. Your task description never leaves the page.</li>
+        <li>The ranking runs entirely in your browser. It does not call any model, and Model Scout has no accounts, no server, and no tracking. Your task description never leaves the page.</li>
+        <li>The Ask a model panel is the only part that calls a model, and only when you press Send. With OpenRouter it sends your messages and your own key straight from your browser to openrouter.ai, and OpenRouter and the model provider handle them under their own policies. With Local Ollama it sends them to Ollama on your computer. Your key stays in this browser's local storage; conversations are not saved anywhere and are gone when you reload.</li>
       </ul>
     </section>
   </main>

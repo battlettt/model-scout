@@ -15,6 +15,12 @@ var HTML = fs.readFileSync(path.join(ROOT, "index.html"), "utf8").replace('<scri
 var APP = fs.readFileSync(path.join(ROOT, "app.js"), "utf8");
 var CATALOG = JSON.parse(fs.readFileSync(path.join(ROOT, "catalog.json"), "utf8"));
 var OR_URL = "https://openrouter.ai/api/v1/models";
+var CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
+var OLLAMA_URL = "http://localhost:11434/api/chat";
+var KEY_NAME = "model-scout.openrouter-key";
+var DUMMY_KEY = ["dom", "test", "dummy", "value"].join("-"); // built at runtime, not a real key
+var VENICE = "cognitivecomputations/dolphin-mistral-24b-venice-edition";
+var HERMES = "nousresearch/hermes-3-llama-3.1-70b";
 var results = { pass: 0, fail: 0, failures: [] };
 
 function ok(cond, msg) { if (!cond) throw new Error(msg); }
@@ -40,15 +46,22 @@ function staleCatalog() {
 
 function boot(opts) {
   var dom = new JSDOM(HTML, { url: opts.url || "http://localhost:8000/model-scout/index.html", runScripts: "outside-only", pretendToBeVisual: true });
-  var w = dom.window, calls = [];
-  w.fetch = function (url) {
+  var w = dom.window, calls = [], chats = [];
+  if (typeof w.TextDecoder !== "function") w.TextDecoder = require("util").TextDecoder;
+  if (opts.key) w.localStorage.setItem(KEY_NAME, opts.key);
+  w.fetch = function (url, init) {
     calls.push(String(url));
     if (String(url) === OR_URL) return opts.openrouter ? opts.openrouter() : Promise.reject(new TypeError("Failed to fetch"));
     if (String(url) === "catalog.json") return opts.catalog ? opts.catalog() : resp(CATALOG);
+    if (String(url) === CHAT_URL || String(url) === OLLAMA_URL) {
+      var c = { url: String(url), init: init, body: JSON.parse(init.body) };
+      chats.push(c);
+      return opts.chat ? opts.chat(c) : Promise.reject(new TypeError("Failed to fetch"));
+    }
     return Promise.reject(new Error("unexpected fetch " + url));
   };
   w.eval(APP);
-  return { w: w, d: w.document, calls: calls, $: function (id) { return w.document.getElementById(id); } };
+  return { w: w, d: w.document, calls: calls, chats: chats, $: function (id) { return w.document.getElementById(id); } };
 }
 function waitFor(fn, label) {
   var start = Date.now();
@@ -244,6 +257,150 @@ test("accessibility structure: skip link, labelled controls, links into cards", 
     Array.prototype.forEach.call(p.d.querySelectorAll("#cards svg, #top-pick svg"), function (s) {
       ok(s.getAttribute("aria-hidden") === "true", "svg not hidden from screen readers");
     });
+  });
+});
+
+function orReply(text) { return resp({ choices: [{ message: { role: "assistant", content: text } }] }); }
+function typeAndSend(p, inputId, buttonId, text) { p.$(inputId).value = text; p.$(buttonId).click(); }
+function pick(p, id, value) { p.$(id).value = value; fire(p, id, "change"); }
+function check(p, id) { p.$(id).checked = true; fire(p, id, "change"); }
+
+test("chat: no key prompts for one; the saved key lives only in localStorage and the Bearer header", function () {
+  var p = boot({ chat: function (c) { return orReply(c.body.messages.length > 1 ? "Second answer" : "Bonjour <b>!</b>"); } });
+  return settled(p).then(function () {
+    ok(p.$("chat-model").value === VENICE, "default model is Venice: " + p.$("chat-model").value);
+    ok(/No key saved yet/.test(p.$("chat-key-status").textContent), "key status");
+    typeAndSend(p, "chat-input", "chat-send", "Hello");
+    ok(p.chats.length === 0, "sent without a key");
+    ok(/Add your OpenRouter key/.test(p.$("chat-key-error").textContent), "no prompt for a key");
+    ok(p.d.activeElement === p.$("chat-key"), "focus not moved to the key box");
+    ok(p.$("chat-key").getAttribute("aria-invalid") === "true", "key field not marked");
+    p.$("chat-key").value = DUMMY_KEY; p.$("chat-key-save").click();
+    ok(p.w.localStorage.getItem(KEY_NAME) === DUMMY_KEY, "key not in localStorage");
+    ok(p.$("chat-key").value === "" && p.d.documentElement.outerHTML.indexOf(DUMMY_KEY) < 0, "full key left in the page");
+    ok(new RegExp("ending in " + DUMMY_KEY.slice(-4)).test(p.$("chat-key-status").textContent), "masked status");
+    ok(!p.$("chat-key-forget").disabled, "forget disabled with a key saved");
+    p.$("chat-send").click();
+    ok(p.chats.length === 1, "message not sent after the key was saved");
+    var c = p.chats[0];
+    ok(c.url === CHAT_URL && c.init.method === "POST", "wrong endpoint");
+    ok(c.init.headers.Authorization === "Bearer " + DUMMY_KEY, "Bearer header");
+    ok(c.body.model === VENICE && JSON.stringify(c.body.messages) === JSON.stringify([{ role: "user", content: "Hello" }]), "body " + JSON.stringify(c.body));
+    ok(p.$("chat-send").disabled && p.$("chat-log").getAttribute("aria-busy") === "true", "busy state while sending");
+    return waitFor(function () { return /Bonjour/.test(p.$("chat-log").textContent); }, "answer in the log").then(function () {
+      ok(!p.$("chat-log").querySelector("b"), "answer HTML was injected");
+      ok(/Venice Uncensored/.test(p.$("chat-log").textContent), "answer not labelled with the model");
+      ok(!p.$("chat-send").disabled, "send stays disabled");
+      typeAndSend(p, "chat-input", "chat-send", "And again");
+      return waitFor(function () { return /Second answer/.test(p.$("chat-log").textContent); }, "second answer");
+    }).then(function () {
+      ok(p.chats[1].body.messages.map(function (m) { return m.role; }).join(",") === "user,assistant,user", "history not sent");
+      p.$("chat-key-forget").click();
+      ok(p.w.localStorage.getItem(KEY_NAME) === null && /No key saved/.test(p.$("chat-key-status").textContent), "forget key");
+    });
+  });
+});
+
+test("side by side: two labelled columns, and one failing column does not block the other", function () {
+  var p = boot({ key: DUMMY_KEY, chat: function (c) {
+    if (c.body.model === HERMES) return Promise.reject(new TypeError("Failed to fetch"));
+    return new Promise(function (r) { setTimeout(function () { r({ ok: true, status: 200, json: function () { return Promise.resolve({ choices: [{ message: { content: "Left wins" } }] }); } }); }, 20); });
+  } });
+  return settled(p).then(function () {
+    check(p, "chat-mode-side");
+    ok(p.$("chat-single").hidden && !p.$("chat-side").hidden, "mode switch");
+    ok(p.$("side-model-a").value === "" && p.$("side-model-b").value === "", "slots should start empty");
+    pick(p, "side-model-a", VENICE); pick(p, "side-model-b", HERMES);
+    ok(/Venice Uncensored/.test(p.$("side-col-a").textContent) && /Nous Hermes 3 70B/.test(p.$("side-col-b").textContent), "columns follow the pickers");
+    typeAndSend(p, "side-input", "side-send", "Capital of France?");
+    ok(p.chats.length === 2, "both requests should fire at once, got " + p.chats.length);
+    ok(p.$("side-send").disabled, "send-both not disabled while busy");
+    return waitFor(function () {
+      return p.$("side-col-a").getAttribute("data-status") !== "sending" && p.$("side-col-b").getAttribute("data-status") !== "sending";
+    }, "both columns to settle").then(function () {
+      var a = p.$("side-col-a"), b = p.$("side-col-b");
+      ok(a.getAttribute("data-status") === "done" && /Left wins/.test(a.textContent) && /Done/.test(a.querySelector(".badge").textContent), "left: " + a.textContent);
+      ok(b.getAttribute("data-status") === "error" && /Could not reach OpenRouter/.test(b.textContent) && /Error/.test(b.querySelector(".badge").textContent), "right: " + b.textContent);
+      ok(/Venice Uncensored/.test(a.querySelector(".side-name").textContent) && /Nous Hermes 3 70B/.test(b.querySelector(".side-name").textContent), "column labels");
+      ok(!p.$("side-send").disabled && /One column failed/.test(p.$("chat-status").textContent), "summary: " + p.$("chat-status").textContent);
+      ok(p.$("side-input").value === "Capital of France?", "question should stay for a re-send");
+    });
+  });
+});
+
+test("ask this model: sets the chat model in single mode; fills the first empty slot, then the left, side by side", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    var btns = p.d.querySelectorAll("#cards .ask-btn:not([disabled])");
+    ok(btns.length === p.d.querySelectorAll("#cards .card").length, "one ask button per card");
+    var one = btns[0], two = btns[1];
+    one.click();
+    ok(p.$("chat-model").value === one.getAttribute("data-ask"), "chat model not set");
+    ok(p.d.activeElement === p.$("chat-input"), "chat input not focused");
+    ok(new RegExp("Chat model set to " + one.getAttribute("data-name")).test(p.$("chat-status").textContent), "status");
+    check(p, "chat-mode-side");
+    one.click();
+    ok(p.$("side-model-a").value === one.getAttribute("data-ask") && p.$("side-model-b").value === "", "first click fills the left slot");
+    two.click();
+    ok(p.$("side-model-b").value === two.getAttribute("data-ask"), "second click fills the empty right slot");
+    two.click();
+    ok(p.$("side-model-a").value === two.getAttribute("data-ask") && p.$("side-model-b").value === two.getAttribute("data-ask"), "both filled: left is replaced");
+    ok(p.d.activeElement === p.$("side-input"), "side input not focused");
+    check(p, "chat-provider-local");
+    one.click();
+    ok(p.$("chat-provider-openrouter").checked && /Switched the provider to OpenRouter/.test(p.$("chat-status").textContent), "local mode not switched back");
+    p.$("task-type").value = "embeddings"; fire(p, "task-type", "change");
+    var off = p.d.querySelectorAll("#cards .ask-btn[disabled]");
+    ok(off.length === p.d.querySelectorAll("#cards .card").length && /cannot chat/.test(p.$("cards").textContent), "embedding cards should explain why they cannot chat");
+  });
+});
+
+test("local provider: localhost URL, model dolphin3, no key or Authorization header, localhost explanation shown", function () {
+  var p = boot({ url: "http://localhost:8000/", key: DUMMY_KEY, chat: function () { return resp({ message: { role: "assistant", content: "Hi from dolphin3" }, done: true }); } });
+  return settled(p).then(function () {
+    check(p, "chat-provider-local");
+    ok(p.$("chat-key-box").hidden && !p.$("chat-local-note").hidden, "key box should hide, local note show");
+    ok(p.$("chat-model").disabled && /always uses dolphin3/.test(p.$("chat-model-note").textContent), "picker note");
+    ok(/served from localhost:8000/.test(p.$("chat-local-check").textContent) && p.$("chat-local-check").classList.contains("ok"), "local check");
+    ok(/public https site cannot call http:\/\/localhost/.test(p.$("chat-local-note").textContent), "https explanation");
+    typeAndSend(p, "chat-input", "chat-send", "Hi");
+    var c = p.chats[0];
+    ok(c && c.url === OLLAMA_URL, "not sent to Ollama");
+    ok(c.body.model === "dolphin3" && c.body.stream === false, "body " + JSON.stringify(c.body));
+    ok(!c.init.headers.Authorization, "key leaked to Ollama");
+    return waitFor(function () { return /Hi from dolphin3/.test(p.$("chat-log").textContent); }, "local answer").then(function () {
+      ok(/dolphin3 \(local Ollama\)/.test(p.$("chat-log").textContent), "local answer label");
+      var pub = boot({ url: "https://battlettt.github.io/model-scout/" });
+      return settled(pub).then(function () {
+        check(pub, "chat-provider-local");
+        ok(/battlettt\.github\.io/.test(pub.$("chat-local-check").textContent) && pub.$("chat-local-check").classList.contains("warn"), "public site warning");
+      });
+    });
+  });
+});
+
+test("streaming: tokens render as they arrive, then the answer is final", function () {
+  var enc = new (require("util").TextEncoder)(), steps = [], gate;
+  var chunks = ['data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n', 'data: {"choices":[{"delta":{"content":"lo there"}}]}\n\ndata: [DONE]\n\n'];
+  var p = boot({ key: DUMMY_KEY, chat: function () {
+    var i = 0;
+    return resp(null).then(function (r) {
+      r.body = { getReader: function () { return { read: function () {
+        if (i === 1) return new Promise(function (res) { gate = function () { res({ done: false, value: enc.encode(chunks[i++]) }); }; });
+        return Promise.resolve(i < chunks.length ? { done: false, value: enc.encode(chunks[i++]) } : { done: true });
+      }, cancel: function () {} }; } };
+      return r;
+    });
+  } });
+  return settled(p).then(function () {
+    p.$("chat-stream").checked = true;
+    typeAndSend(p, "chat-input", "chat-send", "Hi");
+    ok(p.chats[0].body.stream === true, "stream flag not sent");
+    return waitFor(function () { return gate && /Hel/.test(p.$("chat-log").textContent); }, "first token");
+  }).then(function () {
+    ok(!/lo there/.test(p.$("chat-log").textContent) && p.$("chat-send").disabled, "should be mid-stream");
+    gate();
+    return waitFor(function () { return /Hello there/.test(p.$("chat-log").textContent) && !p.$("chat-send").disabled; }, "full streamed answer");
   });
 });
 

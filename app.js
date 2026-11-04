@@ -1,7 +1,9 @@
 /* Model Scout v1: client-side ranking engine and UI.
    The engine functions are pure and exported for node tests (tests/run_tests.js).
-   The UI code only runs in a browser. No model APIs are called; the only network
-   requests are catalog.json (same folder) and the public OpenRouter model list. */
+   The UI code only runs in a browser. The ranker calls no model: it fetches catalog.json
+   (same folder) and the public OpenRouter model list. Only the "Ask a model" panel calls a
+   model, when the user presses Send: OpenRouter chat with the user's own key (kept in
+   localStorage, never in this repo), or Ollama on localhost with no key. */
 (function (root) {
   "use strict";
 
@@ -385,12 +387,291 @@
     return String(n);
   }
 
+  // ---------- chat: OpenRouter (your key) or local Ollama (no key) ----------
+  // Pure helpers: they build requests and read answers, and take fetch and storage as
+  // arguments, so node tests can drive them with stubs. No key is ever stored in code.
+  var OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
+  var OLLAMA_CHAT_URL = "http://localhost:11434/api/chat";
+  var LOCAL_MODEL = "dolphin3";
+  var LOCAL_LABEL = "dolphin3 (local Ollama)";
+  var DEFAULT_CHAT_MODEL = "cognitivecomputations/dolphin-mistral-24b-venice-edition";
+  var FEATURED_CHAT_MODELS = [
+    { id: DEFAULT_CHAT_MODEL, name: "Venice Uncensored" },
+    { id: "nousresearch/hermes-3-llama-3.1-70b", name: "Nous Hermes 3 70B" }
+  ];
+  var KEY_STORAGE = "model-scout.openrouter-key";
+  var CHAT_TIMEOUT_MS = 120000; // no answer (or no new streamed text) for this long stops the request
+  var SIDE_STATUS = {
+    idle: { cls: "idle", text: "Ready" }, sending: { cls: "live", text: "Sending" },
+    done: { cls: "ok", text: "Done" }, error: { cls: "warn", text: "Error" }
+  };
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (ch) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
+    });
+  }
+
+  /** Request for one chat call. OpenRouter needs a key (sent as a Bearer header); local Ollama always uses dolphin3 and no key. */
+  function buildChatRequest(provider, model, messages, key, stream) {
+    var msgs = (messages || []).map(function (m) { return { role: m.role, content: String(m.content) }; });
+    if (provider === "local") {
+      return {
+        ok: true, provider: "local", model: LOCAL_MODEL, stream: !!stream, url: OLLAMA_CHAT_URL,
+        init: { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: LOCAL_MODEL, messages: msgs, stream: !!stream }) }
+      };
+    }
+    var k = String(key || "").trim();
+    if (!k) return { ok: false, code: "no-key", error: "No OpenRouter key saved. Paste your key in the key box and press Save key." };
+    if (!model) return { ok: false, code: "no-model", error: "Choose a model first." };
+    var body = { model: model, messages: msgs };
+    if (stream) body.stream = true;
+    return {
+      ok: true, provider: "openrouter", model: model, stream: !!stream, url: OPENROUTER_CHAT_URL,
+      init: { method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + k }, body: JSON.stringify(body) }
+    };
+  }
+
+  /** The error message inside an OpenRouter ({ error: { message } }) or Ollama ({ error: "..." }) body. */
+  function chatErrorDetail(j) {
+    if (!j || !j.error) return "";
+    var e = j.error, msg = typeof e === "string" ? e : (e.message || "");
+    return String(msg).slice(0, 300);
+  }
+
+  /** The answer text in a non-streamed response, or null when the shape is not recognised. */
+  function chatText(provider, j) {
+    if (!j || typeof j !== "object") return null;
+    if (provider === "local") return j.message && typeof j.message.content === "string" ? j.message.content : null;
+    var c = j.choices && j.choices[0];
+    return c && c.message && typeof c.message.content === "string" ? c.message.content : null;
+  }
+
+  function httpErrorText(provider, status, detail) {
+    var who = provider === "local" ? "Ollama" : "OpenRouter";
+    var said = detail ? " " + who + " said: " + detail : "";
+    if (provider !== "local") {
+      if (status === 401) return "OpenRouter rejected the key (HTTP 401). Check or replace the key in the key box." + said;
+      if (status === 402) return "Your OpenRouter account does not have enough credits for this model (HTTP 402)." + said;
+      if (status === 403) return "OpenRouter refused this request (HTTP 403), for example a moderation block." + said;
+      if (status === 404) return "OpenRouter does not serve this model right now (HTTP 404). Pick another model." + said;
+      if (status === 429) return "OpenRouter is rate limiting this key or model (HTTP 429). Wait a moment and try again." + said;
+    } else if (status === 404) {
+      return "Ollama does not have the dolphin3 model (HTTP 404). Run: ollama pull dolphin3." + said;
+    }
+    return who + " returned HTTP " + status + "." + said;
+  }
+
+  /** Can this page reach Ollama? Only when served over plain http from this computer. */
+  function localModeCheck(href) {
+    var u;
+    try { u = new URL(String(href)); } catch (e) { return { ok: false, text: "Could not tell where this page is served from." }; }
+    var host = u.hostname.replace(/^\[|\]$/g, "");
+    var isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1" || /\.localhost$/.test(host);
+    if (u.protocol === "http:" && isLocal) return { ok: true, text: "This page is served from " + u.host + ", so it can reach Ollama on this computer." };
+    if (u.protocol === "file:") return { ok: false, text: "This page is open as a file. Serve the folder from localhost (python3 -m http.server 8000) so it can reach Ollama." };
+    return { ok: false, text: "This page is served from " + u.host + " over " + u.protocol.replace(":", "") + ", so the browser will block calls to Ollama. Serve Model Scout from localhost to use local mode." };
+  }
+
+  function networkErrorText(provider, err, pageUrl, timeoutMs) {
+    if (err && err.name === "AbortError") return "No answer for " + Math.round(timeoutMs / 1000) + " seconds, so the request was stopped. Try again or pick a faster model.";
+    var why = err && err.message ? err.message : "unknown error";
+    if (provider === "local") {
+      var where = localModeCheck(pageUrl);
+      return "Could not reach Ollama on localhost port 11434 (" + why + "). Check that Ollama is running and has dolphin3." + (where.ok ? "" : " " + where.text);
+    }
+    return "Could not reach OpenRouter (" + why + "). Check your connection, or whether an extension blocks openrouter.ai.";
+  }
+
+  /** Split a growing stream buffer into whole lines plus the unfinished tail. */
+  function takeLines(buf) {
+    var parts = String(buf).split(/\r?\n/);
+    return { lines: parts.slice(0, -1), rest: parts[parts.length - 1] };
+  }
+
+  /** One streamed line: OpenRouter sends server-sent events ("data: {...}", ": comment", "data: [DONE]"), Ollama sends JSON lines. */
+  function streamDelta(provider, line) {
+    var s = String(line || "").trim();
+    if (!s) return {};
+    if (provider !== "local") {
+      if (s.indexOf("data:") !== 0) return {}; // comments such as ": OPENROUTER PROCESSING", and event or id lines
+      s = s.slice(5).trim();
+      if (s === "[DONE]") return { done: true };
+    }
+    var j;
+    try { j = JSON.parse(s); } catch (e) { return {}; }
+    if (j && j.error) return { error: chatErrorDetail(j) || "The stream reported an error." };
+    if (provider === "local") return { text: (j.message && typeof j.message.content === "string") ? j.message.content : "", done: !!j.done };
+    var c = j.choices && j.choices[0];
+    return { text: c && c.delta && typeof c.delta.content === "string" ? c.delta.content : "" };
+  }
+
+  /**
+   * Send one chat request. Never rejects: resolves { ok, text, error, status }.
+   * opts.onDelta(textSoFar) runs as streamed text arrives. A partial streamed answer is kept on error.
+   */
+  function sendChat(fetchFn, req, opts) {
+    opts = opts || {};
+    if (!req || !req.ok) return Promise.resolve({ ok: false, text: "", error: (req && req.error) || "Nothing to send." });
+    if (typeof fetchFn !== "function") return Promise.resolve({ ok: false, text: "", error: "This browser cannot send requests (no fetch)." });
+    var timeoutMs = opts.timeoutMs || CHAT_TIMEOUT_MS;
+    var ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    var timer = null;
+    function arm() { clearTimeout(timer); timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, timeoutMs); }
+    var init = {};
+    Object.keys(req.init).forEach(function (k) { init[k] = req.init[k]; });
+    if (ctrl) init.signal = ctrl.signal;
+    var acc = { text: "" };
+    function delta(d) {
+      if (d.text) { acc.text += d.text; if (opts.onDelta) opts.onDelta(acc.text); }
+    }
+    arm();
+    var p;
+    try { p = Promise.resolve(fetchFn(req.url, init)); } catch (e) { p = Promise.reject(e); }
+    return p.then(function (res) {
+      if (!res.ok) {
+        var body = typeof res.json === "function" ? res.json().catch(function () { return null; }) : Promise.resolve(null);
+        return body.then(function (j) { return { ok: false, status: res.status, text: "", error: httpErrorText(req.provider, res.status, chatErrorDetail(j)) }; });
+      }
+      if (req.stream) return readStream(res, req, delta, arm, acc);
+      return res.json().then(function (j) {
+        var detail = chatErrorDetail(j);
+        if (detail) return { ok: false, status: res.status, text: "", error: (req.provider === "local" ? "Ollama" : "OpenRouter") + " reported an error: " + detail };
+        var t = chatText(req.provider, j);
+        if (t === null) return { ok: false, status: res.status, text: "", error: "The response did not contain an answer Model Scout can read." };
+        if (!t.trim()) return { ok: false, status: res.status, text: "", error: "The model returned an empty answer." };
+        return { ok: true, status: res.status, text: t, error: "" };
+      }, function () {
+        return { ok: false, status: res.status, text: "", error: "The response was not valid JSON." };
+      });
+    }).catch(function (e) {
+      return { ok: false, text: acc.text, error: networkErrorText(req.provider, e, opts.pageUrl, timeoutMs) };
+    }).then(function (r) { clearTimeout(timer); return r; });
+  }
+
+  /** Read a streamed body chunk by chunk. Falls back to reading it whole when the browser has no stream reader. */
+  function readStream(res, req, delta, arm, acc) {
+    var failed = "";
+    function handle(lines) {
+      for (var i = 0; i < lines.length && !failed; i++) {
+        var d = streamDelta(req.provider, lines[i]);
+        if (d.error) failed = d.error;
+        else delta(d);
+      }
+    }
+    function finish() {
+      if (failed) return { ok: false, status: res.status, text: acc.text, error: "The model stopped with an error: " + failed };
+      if (!acc.text.trim()) return { ok: false, status: res.status, text: "", error: "The model returned an empty answer." };
+      return { ok: true, status: res.status, text: acc.text, error: "" };
+    }
+    var reader = res.body && typeof res.body.getReader === "function" && typeof TextDecoder === "function" ? res.body.getReader() : null;
+    if (!reader) {
+      return res.text().then(function (all) { handle(String(all).split(/\r?\n/)); return finish(); });
+    }
+    var dec = new TextDecoder(), buf = "";
+    function pump() {
+      return reader.read().then(function (r) {
+        arm(); // each chunk restarts the idle timer
+        if (r.done) { buf += dec.decode(); handle([buf]); return finish(); }
+        var split = takeLines(buf + dec.decode(r.value, { stream: true }));
+        buf = split.rest;
+        handle(split.lines);
+        if (failed) { try { reader.cancel(); } catch (e) { /* already closed */ } return finish(); }
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  /**
+   * Side by side: fire every column at once. Each column settles on its own, so a failure (or a render
+   * problem) in one never blocks the other. cols: [{ model, label, req }]. onUpdate(index, column) runs
+   * on every status change. Resolves with the final columns.
+   */
+  function runCompare(fetchFn, cols, onUpdate, opts) {
+    opts = opts || {};
+    return Promise.all(cols.map(function (col, i) {
+      var st = { model: col.model || "", label: col.label || "", status: "sending", text: "", error: "" };
+      function update() { try { if (onUpdate) onUpdate(i, st); } catch (e) { /* keep the other column going */ } }
+      if (!col.req || !col.req.ok) {
+        st.status = "error";
+        st.error = (col.req && col.req.error) || "No model chosen for this column.";
+        update();
+        return Promise.resolve(st);
+      }
+      update();
+      return sendChat(fetchFn, col.req, { pageUrl: opts.pageUrl, timeoutMs: opts.timeoutMs, onDelta: function (t) { st.text = t; update(); } })
+        .then(function (r) {
+          st.status = r.ok ? "done" : "error";
+          st.text = r.text || st.text;
+          st.error = r.ok ? "" : r.error;
+          update();
+          return st;
+        }, function (e) {
+          st.status = "error";
+          st.error = "Unexpected error: " + (e && e.message ? e.message : "unknown");
+          update();
+          return st;
+        });
+    }));
+  }
+
+  /** One side-by-side column: which side, the model name, its status, then the answer or the error. */
+  function sideColumnHtml(side, col) {
+    col = col || {};
+    var st = SIDE_STATUS[col.status] || SIDE_STATUS.idle;
+    var body;
+    if (col.status === "error") {
+      body = (col.text ? '<div class="msg-text">' + escapeHtml(col.text) + "</div>" : "") + '<p class="verdict warn">' + escapeHtml(col.error) + "</p>";
+    } else if (col.text) {
+      body = '<div class="msg-text">' + escapeHtml(col.text) + "</div>";
+    } else if (col.status === "sending") {
+      body = '<p class="loading-line"><span class="spinner" aria-hidden="true"></span>Waiting for ' + escapeHtml(col.label || "the model") + "...</p>";
+    } else {
+      body = '<p class="muted">The answer appears here.</p>';
+    }
+    return '<header class="side-head"><p class="eyebrow">' + escapeHtml(side) + "</p>" +
+      '<h3 class="side-name">' + escapeHtml(col.label || "No model chosen") + "</h3>" +
+      '<span class="badge ' + st.cls + '">' + st.text + "</span>" +
+      (col.model ? '<p class="side-id">' + escapeHtml(col.model) + "</p>" : "") + "</header>" +
+      '<div class="side-body">' + body + "</div>";
+  }
+
+  /** Where "Ask this model" goes: the chat model in single mode; in side by side, the first empty slot, else the left one. */
+  function askTarget(mode, slots) {
+    if (mode !== "side") return { target: "single" };
+    var s = slots || [];
+    return { target: "slot", index: !s[0] ? 0 : (!s[1] ? 1 : 0) };
+  }
+
+  // The key lives in the browser's localStorage only. These take the storage object so tests can stub it.
+  function readKey(storage) {
+    try { return (storage && storage.getItem(KEY_STORAGE)) || ""; } catch (e) { return ""; }
+  }
+  function saveKey(storage, key) {
+    var k = String(key || "").trim();
+    if (!k) return { ok: false, error: "Paste a key first." };
+    if (/\s/.test(k)) return { ok: false, error: "That key contains spaces. Copy it again from openrouter.ai/keys." };
+    try { storage.setItem(KEY_STORAGE, k); return { ok: true }; } catch (e) {
+      return { ok: false, error: "This browser blocks local storage, so the key cannot be saved here. Allow site data for this page, or use Local Ollama." };
+    }
+  }
+  function forgetKey(storage) {
+    try { storage.removeItem(KEY_STORAGE); return true; } catch (e) { return false; }
+  }
+
   var api = {
     STALE_AFTER_DAYS: STALE_AFTER_DAYS, REQUIRED_FIELDS: REQUIRED_FIELDS, SWITCH_MARGIN: SWITCH_MARGIN,
     monthlyCost: monthlyCost, blendedPrice: blendedPrice, staleStatus: staleStatus, validateEntry: validateEntry,
     dataFlags: dataFlags, computeWeights: computeWeights, scoreModel: scoreModel, rankModels: rankModels,
     switchCheck: switchCheck, mergeLive: mergeLive, suggestFromText: suggestFromText, costScoreFromPrice: costScoreFromPrice,
-    fmtMoney: fmtMoney, fmtTokens: fmtTokens
+    fmtMoney: fmtMoney, fmtTokens: fmtTokens,
+    OPENROUTER_CHAT_URL: OPENROUTER_CHAT_URL, OLLAMA_CHAT_URL: OLLAMA_CHAT_URL, LOCAL_MODEL: LOCAL_MODEL,
+    DEFAULT_CHAT_MODEL: DEFAULT_CHAT_MODEL, FEATURED_CHAT_MODELS: FEATURED_CHAT_MODELS, KEY_STORAGE: KEY_STORAGE,
+    buildChatRequest: buildChatRequest, chatText: chatText, httpErrorText: httpErrorText, localModeCheck: localModeCheck,
+    takeLines: takeLines, streamDelta: streamDelta, sendChat: sendChat, runCompare: runCompare,
+    sideColumnHtml: sideColumnHtml, askTarget: askTarget, readKey: readKey, saveKey: saveKey, forgetKey: forgetKey
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   if (typeof document === "undefined") return;
@@ -398,7 +679,7 @@
   // =====================================================================
   // Browser UI
   // =====================================================================
-  var state = { catalog: null, catalogOrigin: "", base: [], liveOnly: [], live: null, now: new Date(), lastOrder: null };
+  var state = { catalog: null, catalogOrigin: "", base: [], liveOnly: [], live: null, liveIds: null, now: new Date(), lastOrder: null };
 
   function $(id) { return document.getElementById(id); }
   function esc(s) {
@@ -572,6 +853,7 @@
         (m.limits.length ? '<p class="facts"><strong>Limits:</strong> ' + esc(m.limits.join("; ")) + ".</p>" : "") +
         flagList(flags) +
         '<p class="source">Source: <a href="' + esc(safeUrl(m.source.url)) + '" rel="noopener">' + esc(m.source.name) + "</a>. " + dataBadge(m) + "</p>" +
+        askButton(m) +
         "</article>";
     }).join("") : '<p class="cards-empty">No model cards to show: every candidate failed a hard constraint. Loosen one in the profile above.</p>';
 
@@ -681,6 +963,8 @@
     }).then(function (j) {
       if (!j || !Array.isArray(j.data)) throw new Error("unexpected response format");
       var at = new Date();
+      state.liveIds = {};
+      j.data.forEach(function (x) { if (x && x.id) state.liveIds[x.id] = true; });
       var m = mergeLive(state.catalog.models, j.data, at);
       state.base = m.models;
       state.liveOnly = m.liveOnly;
@@ -688,6 +972,342 @@
     }).catch(function (e) {
       state.live = { ok: false, error: e && e.name === "AbortError" ? "timed out" : "blocked, offline, or failed: " + (e && e.message ? e.message : "unknown error") };
     }).then(function () { clearTimeout(timer); });
+  }
+
+  // ---------- Ask a model: chat panel, key box, side by side ----------
+  // chat.side holds the last state of each side-by-side column (null = follow the picker).
+  var chat = { entries: [], busy: false, sideBusy: false, extra: [], side: [null, null] };
+
+  function keyStorage() { try { return window.localStorage; } catch (e) { return null; } }
+  function chatFetch(url, init) { return fetch(url, init); }
+  function chatProvider() { return $("chat-provider-local").checked ? "local" : "openrouter"; }
+  function chatMode() { return $("chat-mode-side").checked ? "side" : "single"; }
+
+  /** The button at the foot of every model card. Models that cannot chat get a disabled button and the reason. */
+  function askButton(m) {
+    if (m.kind === "embedding" || !m.openrouter_id) {
+      var nid = "ask-note-" + m.id;
+      return '<div class="card-actions"><button type="button" class="btn ask-btn" disabled aria-describedby="' + esc(nid) + '">Ask this model</button>' +
+        '<small id="' + esc(nid) + '">' + (m.kind === "embedding" ? "Embedding models make search vectors and cannot chat." :
+          "Not listed on OpenRouter, so it cannot be asked from here.") + "</small></div>";
+    }
+    return '<div class="card-actions"><button type="button" class="btn ask-btn" data-ask="' + esc(m.openrouter_id) + '" data-name="' + esc(m.model) + '">' +
+      'Ask this model<span class="visually-hidden">: ' + esc(m.model) + "</span></button></div>";
+  }
+
+  /** Every model the chat can name: featured, catalog (with live prices once loaded), live-only, and models added from cards. */
+  function chatPool() { return state.base.concat(state.liveOnly).concat(chat.extra); }
+
+  function chatModelLabel(id) {
+    if (!id) return "";
+    var i, pool = chatPool();
+    for (i = 0; i < FEATURED_CHAT_MODELS.length; i++) if (FEATURED_CHAT_MODELS[i].id === id) return FEATURED_CHAT_MODELS[i].name;
+    for (i = 0; i < pool.length; i++) if (pool[i].openrouter_id === id) return pool[i].model;
+    return id;
+  }
+
+  function chatOptionsHtml(withEmpty) {
+    var live = state.liveIds, seen = {};
+    function opt(id, label) {
+      seen[id] = true;
+      var missing = live && !live[id] ? " (not in OpenRouter's live list today)" : "";
+      return '<option value="' + esc(id) + '">' + esc(label + missing) + "</option>";
+    }
+    var html = withEmpty ? '<option value="">Choose a model</option>' : "";
+    html += '<optgroup label="Suggested for chat">' + FEATURED_CHAT_MODELS.map(function (f) { return opt(f.id, f.name); }).join("") + "</optgroup>";
+    var cat = state.base.filter(function (m) { return m.kind === "generation" && m.openrouter_id && !seen[m.openrouter_id]; })
+      .sort(function (a, b) { return a.model.localeCompare(b.model); });
+    if (cat.length) {
+      html += '<optgroup label="From the Model Scout catalog">' + cat.map(function (m) { return opt(m.openrouter_id, m.model + " (" + m.provider + ")"); }).join("") + "</optgroup>";
+    }
+    var extra = chat.extra.filter(function (m) { return !seen[m.openrouter_id]; });
+    if (extra.length) {
+      html += '<optgroup label="Added from model cards">' + extra.map(function (m) { return opt(m.openrouter_id, m.model); }).join("") + "</optgroup>";
+    }
+    return html;
+  }
+
+  function refill(sel, withEmpty, fallback) {
+    var prev = sel.value;
+    sel.innerHTML = chatOptionsHtml(withEmpty);
+    sel.value = prev;
+    if (sel.value !== prev) sel.value = fallback;
+  }
+
+  function fillChatPickers() {
+    refill($("chat-model"), false, DEFAULT_CHAT_MODEL);
+    refill($("side-model-a"), true, "");
+    refill($("side-model-b"), true, "");
+    renderModelNote();
+    renderSideIdle();
+  }
+
+  function renderModelNote() {
+    var note = $("chat-model-note");
+    if (chatProvider() === "local") { note.textContent = "Local mode always uses dolphin3 in Ollama. This picker applies to OpenRouter."; return; }
+    var id = $("chat-model").value, text = "OpenRouter model id: " + id + ".", pool = chatPool();
+    for (var i = 0; i < pool.length; i++) {
+      var m = pool[i];
+      if (m.openrouter_id === id && m.price_status === "live") {
+        text += " Live price: " + fmtPrice(m.input_price_per_mtok) + " in / " + fmtPrice(m.output_price_per_mtok) + " out per 1M tokens.";
+        break;
+      }
+    }
+    if (state.liveIds && !state.liveIds[id]) text += " Not in OpenRouter's live model list today, so the request may fail.";
+    note.textContent = text;
+  }
+
+  function chatNote(text, level) {
+    var el = $("chat-status");
+    el.textContent = text || "";
+    if (level) el.setAttribute("data-level", level); else el.removeAttribute("data-level");
+  }
+
+  // ----- provider and mode -----
+  function applyProvider() {
+    var local = chatProvider() === "local";
+    $("chat-key-box").hidden = local;
+    $("chat-local-note").hidden = !local;
+    $("chat-model").disabled = local;
+    $("side-model-a").disabled = local;
+    $("side-model-b").disabled = local;
+    var check = localModeCheck(location.href), lc = $("chat-local-check");
+    lc.textContent = check.text;
+    lc.className = "verdict " + (check.ok ? "ok" : "warn");
+    chat.side = chat.side.map(function (c) { return c && c.status === "idle" ? null : c; });
+    renderModelNote();
+    renderSideIdle();
+  }
+
+  function applyMode() {
+    var side = chatMode() === "side";
+    $("chat-single").hidden = side;
+    $("chat-side").hidden = !side;
+    chatNote("");
+  }
+
+  // ----- key box: localStorage only -----
+  function renderKeyStatus() {
+    var store = keyStorage(), k = readKey(store);
+    $("chat-key-status").textContent = !store ? "This browser blocks local storage, so a key cannot be saved here. Local Ollama still works." :
+      k ? "A key is saved in this browser, ending in " + k.slice(-4) + ". Paste a new key to replace it." : "No key saved yet.";
+    $("chat-key-forget").disabled = !k;
+  }
+
+  function keyError(text) {
+    $("chat-key-error").textContent = text || "";
+    if (text) $("chat-key").setAttribute("aria-invalid", "true"); else $("chat-key").removeAttribute("aria-invalid");
+  }
+
+  function promptForKey() {
+    keyError("Add your OpenRouter key to send: paste it here and press Save key. Or switch the provider to Local Ollama.");
+    chatNote("No OpenRouter key saved yet. Add one in the key box.", "warn");
+    $("chat-key").focus();
+  }
+
+  function saveKeyFromForm() {
+    var store = keyStorage();
+    var r = store ? saveKey(store, $("chat-key").value) : { ok: false, error: "This browser blocks local storage, so the key cannot be saved here." };
+    if (!r.ok) { keyError(r.error); return; }
+    $("chat-key").value = "";
+    keyError("");
+    renderKeyStatus();
+    chatNote("Key saved in this browser only.", "ok");
+  }
+
+  function forgetKeyClick() {
+    forgetKey(keyStorage());
+    $("chat-key").value = "";
+    keyError("");
+    renderKeyStatus();
+    chatNote("Key removed from this browser.", "ok");
+  }
+
+  // ----- single model chat -----
+  function renderChatLog() {
+    var log = $("chat-log");
+    if (!chat.entries.length) {
+      log.innerHTML = '<p class="chat-empty">No messages yet. Pick a model, type a question, and press Send. The conversation stays in this page and is gone when you reload.</p>';
+      return;
+    }
+    log.innerHTML = chat.entries.map(function (e) {
+      if (e.role === "user") return '<div class="msg msg-user"><p class="msg-who">You</p><div class="msg-text">' + esc(e.content) + "</div></div>";
+      var who = '<p class="msg-who">' + esc(e.label) + "</p>";
+      var text = e.content ? '<div class="msg-text">' + esc(e.content) + "</div>" : "";
+      if (e.role === "pending") return '<div class="msg msg-model">' + who + (text || '<p class="loading-line"><span class="spinner" aria-hidden="true"></span>Waiting for the answer...</p>') + "</div>";
+      if (e.role === "error") return '<div class="msg msg-model msg-error">' + who + text + '<p class="verdict warn">' + esc(e.error) + "</p></div>";
+      return '<div class="msg msg-model">' + who + text + "</div>";
+    }).join("");
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function setChatBusy(b) {
+    chat.busy = b;
+    $("chat-send").disabled = b;
+    $("chat-send").textContent = b ? "Sending..." : "Send";
+    $("chat-clear").disabled = b;
+    $("chat-log").setAttribute("aria-busy", b ? "true" : "false");
+  }
+
+  /** What the API sees: user and assistant turns only, never error notes or pending placeholders. */
+  function chatHistory() {
+    return chat.entries.filter(function (e) { return e.role === "user" || e.role === "assistant"; })
+      .map(function (e) { return { role: e.role, content: e.content }; });
+  }
+
+  function chatSend() {
+    if (chat.busy) return;
+    var text = $("chat-input").value.trim();
+    if (!text) { chatNote("Type a message first.", "warn"); $("chat-input").focus(); return; }
+    var provider = chatProvider(), key = "";
+    if (provider === "openrouter") {
+      key = readKey(keyStorage());
+      if (!key) { promptForKey(); return; }
+    }
+    var model = provider === "local" ? LOCAL_MODEL : $("chat-model").value;
+    var label = provider === "local" ? LOCAL_LABEL : chatModelLabel(model);
+    chat.entries.push({ role: "user", content: text });
+    var req = buildChatRequest(provider, model, chatHistory(), key, $("chat-stream").checked);
+    var pending = { role: "pending", label: label, content: "", error: "" };
+    chat.entries.push(pending);
+    $("chat-input").value = "";
+    chatNote("Sending to " + label + "...");
+    setChatBusy(true);
+    renderChatLog();
+    sendChat(chatFetch, req, { pageUrl: location.href, onDelta: function (t) { pending.content = t; renderChatLog(); } }).then(function (r) {
+      pending.role = r.ok ? "assistant" : "error";
+      pending.content = r.text || "";
+      pending.error = r.ok ? "" : r.error;
+      setChatBusy(false);
+      renderChatLog();
+      chatNote(r.ok ? "Answer from " + label + "." : "The request failed: see the message in the conversation.", r.ok ? "" : "warn");
+    });
+  }
+
+  // ----- side by side -----
+  function sideColumnFor(i) {
+    if (chatProvider() === "local") return { model: LOCAL_MODEL, label: LOCAL_LABEL };
+    var id = i ? $("side-model-b").value : $("side-model-a").value;
+    return { model: id, label: chatModelLabel(id) };
+  }
+
+  function renderSideCol(i, st) {
+    var el = i ? $("side-col-b") : $("side-col-a");
+    chat.side[i] = st;
+    el.setAttribute("data-status", st.status || "idle");
+    el.setAttribute("aria-busy", st.status === "sending" ? "true" : "false");
+    el.innerHTML = sideColumnHtml(i ? "Right" : "Left", st);
+  }
+
+  /** Columns that are not showing an answer follow their picker. */
+  function renderSideIdle() {
+    [0, 1].forEach(function (i) {
+      var cur = chat.side[i];
+      if (cur && cur.status !== "idle") return;
+      var c = sideColumnFor(i);
+      renderSideCol(i, { status: "idle", model: c.model, label: c.label, text: "", error: "" });
+    });
+  }
+
+  function setSideBusy(b) {
+    chat.sideBusy = b;
+    $("side-send").disabled = b;
+    $("side-send").textContent = b ? "Sending..." : "Send to both";
+  }
+
+  function sideSend() {
+    if (chat.sideBusy) return;
+    var q = $("side-input").value.trim();
+    if (!q) { chatNote("Type a question first.", "warn"); $("side-input").focus(); return; }
+    var provider = chatProvider(), key = "";
+    var ids = [$("side-model-a").value, $("side-model-b").value];
+    if (provider === "openrouter") {
+      if (!ids[0] && !ids[1]) { chatNote("Choose a model for at least one column.", "warn"); $("side-model-a").focus(); return; }
+      key = readKey(keyStorage());
+      if (!key) { promptForKey(); return; }
+    }
+    var msgs = [{ role: "user", content: q }], stream = $("chat-stream").checked;
+    var cols = [0, 1].map(function (i) {
+      var c = sideColumnFor(i);
+      if (!c.model) return { model: "", label: "", req: null };
+      return { model: c.model, label: c.label, req: buildChatRequest(provider, c.model, msgs, key, stream) };
+    });
+    setSideBusy(true);
+    chatNote("Sending to both columns...");
+    runCompare(chatFetch, cols, renderSideCol, { pageUrl: location.href }).then(function (res) {
+      setSideBusy(false);
+      var fails = res.filter(function (c) { return c.status === "error"; }).length;
+      chatNote(fails === 0 ? "Both answers are in." : fails === 1 ? "One column failed; the other answer is shown." : "Both columns failed: see each column for the reason.", fails ? "warn" : "");
+    });
+  }
+
+  // ----- "Ask this model" on the cards -----
+  function askFromCard(btn) {
+    var id = btn.getAttribute("data-ask"), name = btn.getAttribute("data-name") || id;
+    if (!id) return;
+    var listed = Array.prototype.some.call($("chat-model").options, function (o) { return o.value === id; });
+    if (!listed) { chat.extra.push({ openrouter_id: id, model: name }); fillChatPickers(); }
+    var note = "";
+    if (chatProvider() === "local") {
+      $("chat-provider-openrouter").checked = true;
+      applyProvider();
+      note = " Switched the provider to OpenRouter, because local mode only runs dolphin3.";
+    }
+    var t = askTarget(chatMode(), [$("side-model-a").value, $("side-model-b").value]), target;
+    if (t.target === "single") {
+      $("chat-model").value = id;
+      renderModelNote();
+      chatNote("Chat model set to " + name + "." + note + " Type your question below.", "ok");
+      target = $("chat-input");
+    } else {
+      (t.index ? $("side-model-b") : $("side-model-a")).value = id;
+      chat.side[t.index] = null;
+      renderSideIdle();
+      chatNote((t.index ? "Right" : "Left") + " column set to " + name + "." + note, "ok");
+      target = $("side-input");
+    }
+    // Bring the chat panel to the top, then let focus scroll the input into view if it is still below the fold (phones).
+    var panel = $("chat-main");
+    if (panel.scrollIntoView) panel.scrollIntoView({ block: "start" });
+    target.focus();
+  }
+
+  function initChat() {
+    $("chat-provider-openrouter").addEventListener("change", applyProvider);
+    $("chat-provider-local").addEventListener("change", applyProvider);
+    $("chat-mode-single").addEventListener("change", applyMode);
+    $("chat-mode-side").addEventListener("change", applyMode);
+    $("chat-key-form").addEventListener("submit", function (e) { e.preventDefault(); saveKeyFromForm(); });
+    $("chat-key-forget").addEventListener("click", forgetKeyClick);
+    $("chat-key").addEventListener("input", function () { keyError(""); });
+    $("chat-model").addEventListener("change", renderModelNote);
+    $("side-model-a").addEventListener("change", function () { chat.side[0] = null; renderSideIdle(); });
+    $("side-model-b").addEventListener("change", function () { chat.side[1] = null; renderSideIdle(); });
+    $("chat-form").addEventListener("submit", function (e) { e.preventDefault(); chatSend(); });
+    $("side-form").addEventListener("submit", function (e) { e.preventDefault(); sideSend(); });
+    // Enter sends, Shift+Enter adds a line (and never while an input method is composing text).
+    $("chat-input").addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); chatSend(); }
+    });
+    $("side-input").addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sideSend(); }
+    });
+    $("chat-clear").addEventListener("click", function () {
+      if (chat.busy) return;
+      chat.entries = [];
+      renderChatLog();
+      chatNote("Conversation cleared.");
+      $("chat-input").focus();
+    });
+    $("cards").addEventListener("click", function (e) {
+      var b = e.target && e.target.closest ? e.target.closest(".ask-btn") : null;
+      if (b && !b.disabled) askFromCard(b);
+    });
+    fillChatPickers();
+    applyProvider();
+    applyMode();
+    renderKeyStatus();
+    renderChatLog();
   }
 
   function init() {
@@ -698,6 +1318,7 @@
     $("suggest").addEventListener("click", applySuggestions);
     $("include-live").addEventListener("change", render);
     $("current-model").addEventListener("change", renderSwitch);
+    initChat();
     loadCatalog().then(function (cat) {
       state.catalog = cat;
       state.base = cat.models.slice();
@@ -705,7 +1326,8 @@
       $("stale-days").textContent = String(cat.stale_after_days || STALE_AFTER_DAYS);
       renderStatus();
       render();
-      return loadLive().then(function () { renderStatus(); render(); });
+      fillChatPickers();
+      return loadLive().then(function () { renderStatus(); render(); fillChatPickers(); });
     }).catch(function (e) {
       $("data-status").setAttribute("data-state", "error");
       $("data-status").innerHTML = '<p class="verdict warn">Could not load the model catalog (' + esc(e.message) + "). Try serving the folder with python3 -m http.server.</p>";

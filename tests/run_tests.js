@@ -390,11 +390,13 @@ test("every asset reference in index.html is relative", function () {
   });
   ["styles.css", "app.js"].forEach(function (a) { assert.ok(refs.indexOf(a) >= 0, a + " not referenced"); });
 });
-test("app.js fetches only relative catalog.json and the public OpenRouter list", function () {
+test("app.js calls only relative catalog.json, openrouter.ai, and the local Ollama chat URL", function () {
   var js = fs.readFileSync(path.join(ROOT, "app.js"), "utf8");
   assert.ok(/fetch\("catalog\.json"/.test(js));
   var urls = js.match(/https?:\/\/[^\s"')]+/g) || [];
-  urls.forEach(function (u) { assert.ok(/^https:\/\/openrouter\.ai\//.test(u), "unexpected URL in app.js: " + u); });
+  urls.forEach(function (u) {
+    assert.ok(/^https:\/\/openrouter\.ai\//.test(u) || u === "http://localhost:11434/api/chat", "unexpected URL in app.js: " + u);
+  });
 });
 test("no external fonts, frameworks, or trackers", function () {
   var css = fs.readFileSync(path.join(ROOT, "styles.css"), "utf8");
@@ -563,7 +565,8 @@ var TEXT_PAIRS = [
   ["muted", "bg"], ["muted", "surface"], ["muted", "surface-2"], ["muted", "accent-soft"],
   ["accent-text", "bg"], ["accent-text", "surface"], ["accent-text", "accent-soft"],
   ["on-accent", "accent"], ["on-accent", "accent-hover"],
-  ["ok", "ok-soft"], ["warn", "warn-soft"], ["warn", "surface"], ["warn", "bg"], ["live", "live-soft"]
+  ["ok", "ok-soft"], ["warn", "warn-soft"], ["warn", "surface"], ["warn", "bg"], ["live", "live-soft"],
+  ["ok", "surface"], ["bg", "text"] // chat status line; selected segment of the provider and mode toggles
 ];
 [["light", lightTokens], ["dark", darkTokens]].forEach(function (mode) {
   test("text contrast is at least 4.5:1 in " + mode[0] + " mode", function () {
@@ -664,9 +667,465 @@ test("app.js keeps the engine-then-UI layout (engine exported before any DOM cod
 });
 
 // ------------------------------------------------------------------
+// Ask a model: chat engine, key box, side by side, ask-this-model. No network: fetch is always stubbed.
+// No real key appears in this file: the dummy key is assembled at runtime and is not a valid key format.
+var DUMMY_KEY = ["test", "only", "dummy", "value"].join("-");
+var VENICE = "cognitivecomputations/dolphin-mistral-24b-venice-edition";
+var HERMES = "nousresearch/hermes-3-llama-3.1-70b";
+var MSGS = [{ role: "user", content: "Hello" }];
+
+function fakeStorage() {
+  var data = {};
+  return {
+    data: data,
+    getItem: function (k) { return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null; },
+    setItem: function (k, v) { data[k] = String(v); },
+    removeItem: function (k) { delete data[k]; }
+  };
+}
+function blockedStorage() {
+  function no() { var e = new Error("denied"); e.name = "SecurityError"; throw e; }
+  return { getItem: no, setItem: no, removeItem: no };
+}
+function jsonRes(obj, status) {
+  return { ok: !status || status < 400, status: status || 200, json: function () { return Promise.resolve(obj); } };
+}
+function badJsonRes() {
+  return { ok: true, status: 200, json: function () { return Promise.reject(new SyntaxError("Unexpected token")); } };
+}
+function textRes(text) {
+  return { ok: true, status: 200, text: function () { return Promise.resolve(text); } };
+}
+function streamRes(chunks) {
+  var enc = new TextEncoder(), i = 0, reader = { cancelled: false };
+  reader.read = function () {
+    return Promise.resolve(i < chunks.length ? { done: false, value: enc.encode(chunks[i++]) } : { done: true, value: undefined });
+  };
+  reader.cancel = function () { reader.cancelled = true; return Promise.resolve(); };
+  return { ok: true, status: 200, reader: reader, body: { getReader: function () { return reader; } } };
+}
+function orAnswer(text) { return { id: "gen-1", choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }] }; }
+function ollamaAnswer(text) { return { model: "dolphin3", message: { role: "assistant", content: text }, done: true }; }
+function recorder(handler) {
+  var calls = [];
+  var f = function (url, init) { calls.push({ url: url, init: init, body: init && init.body ? JSON.parse(init.body) : null }); return handler(url, init, calls.length); };
+  f.calls = calls;
+  return f;
+}
+
+section("Chat: request building (pure)");
+test("OpenRouter request: chat completions URL, POST, Bearer header from the given key, {model, messages}", function () {
+  var r = S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false);
+  assert.ok(r.ok);
+  assert.strictEqual(r.url, "https://openrouter.ai/api/v1/chat/completions");
+  assert.strictEqual(r.init.method, "POST");
+  assert.strictEqual(r.init.headers.Authorization, "Bearer " + DUMMY_KEY);
+  assert.strictEqual(r.init.headers["Content-Type"], "application/json");
+  assert.deepStrictEqual(JSON.parse(r.init.body), { model: VENICE, messages: MSGS });
+});
+test("the key is trimmed and only extra message fields are dropped", function () {
+  var r = S.buildChatRequest("openrouter", VENICE, [{ role: "user", content: "Hi", label: "You", error: "" }], "  " + DUMMY_KEY + "\n", false);
+  assert.strictEqual(r.init.headers.Authorization, "Bearer " + DUMMY_KEY);
+  assert.deepStrictEqual(JSON.parse(r.init.body).messages, [{ role: "user", content: "Hi" }]);
+});
+test("no key: OpenRouter request is refused before any network call", function () {
+  ["", "   ", null, undefined].forEach(function (k) {
+    var r = S.buildChatRequest("openrouter", VENICE, MSGS, k, false);
+    assert.ok(!r.ok && r.code === "no-key" && /key/i.test(r.error));
+  });
+  assert.ok(!S.buildChatRequest("openrouter", "", MSGS, DUMMY_KEY, false).ok, "no model");
+});
+test("local provider uses the localhost Ollama URL with model dolphin3, stream false, and no key", function () {
+  var r = S.buildChatRequest("local", VENICE, MSGS, "", false);
+  assert.ok(r.ok);
+  assert.strictEqual(r.url, "http://localhost:11434/api/chat");
+  assert.strictEqual(S.OLLAMA_CHAT_URL, "http://localhost:11434/api/chat");
+  assert.strictEqual(r.init.method, "POST");
+  assert.deepStrictEqual(JSON.parse(r.init.body), { model: "dolphin3", messages: MSGS, stream: false });
+  assert.ok(!("Authorization" in r.init.headers), "local mode must not send a key");
+  var withKey = S.buildChatRequest("local", HERMES, MSGS, DUMMY_KEY, false);
+  assert.ok(!("Authorization" in withKey.init.headers), "a saved OpenRouter key never goes to Ollama");
+  assert.strictEqual(JSON.parse(withKey.init.body).model, "dolphin3");
+});
+test("streaming is opt-in: stream:true is sent only when asked", function () {
+  assert.ok(!("stream" in JSON.parse(S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false).init.body)));
+  assert.strictEqual(JSON.parse(S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, true).init.body).stream, true);
+  assert.strictEqual(JSON.parse(S.buildChatRequest("local", "", MSGS, "", true).init.body).stream, true);
+});
+test("default chat model is Venice Uncensored, and Nous Hermes 3 70B is offered", function () {
+  assert.strictEqual(S.DEFAULT_CHAT_MODEL, VENICE);
+  var ids = S.FEATURED_CHAT_MODELS.map(function (m) { return m.id; });
+  assert.deepStrictEqual(ids, [VENICE, HERMES]);
+  assert.strictEqual(S.FEATURED_CHAT_MODELS[0].name, "Venice Uncensored");
+  assert.strictEqual(S.FEATURED_CHAT_MODELS[1].name, "Nous Hermes 3 70B");
+  assert.ok(new RegExp('<select id="chat-model"[^>]*>\\s*<option value="' + VENICE + '" selected>').test(pageHtml), "Venice is the default in the markup");
+});
+test("HTTP errors become plain-language messages", function () {
+  assert.ok(/rejected the key/.test(S.httpErrorText("openrouter", 401, "")));
+  assert.ok(/credits/.test(S.httpErrorText("openrouter", 402, "")));
+  assert.ok(/rate limiting/.test(S.httpErrorText("openrouter", 429, "")));
+  assert.ok(/ollama pull dolphin3/.test(S.httpErrorText("local", 404, "")));
+  assert.ok(/HTTP 500\. OpenRouter said: boom/.test(S.httpErrorText("openrouter", 500, "boom")));
+});
+test("local mode check: works only from a page served over http from this computer", function () {
+  ["http://localhost:8000/", "http://127.0.0.1:5500/model-scout/", "http://[::1]:8000/"].forEach(function (u) { assert.ok(S.localModeCheck(u).ok, u); });
+  var pub = S.localModeCheck("https://battlettt.github.io/model-scout/");
+  assert.ok(!pub.ok && /battlettt\.github\.io/.test(pub.text) && /localhost/.test(pub.text));
+  assert.ok(!S.localModeCheck("file:///Users/x/model-scout/index.html").ok);
+  assert.ok(!S.localModeCheck("not a url").ok);
+});
+test("stream lines: server-sent events, comments, [DONE], Ollama JSON lines, and errors", function () {
+  assert.deepStrictEqual(S.streamDelta("openrouter", ": OPENROUTER PROCESSING"), {});
+  assert.deepStrictEqual(S.streamDelta("openrouter", "data: [DONE]"), { done: true });
+  assert.strictEqual(S.streamDelta("openrouter", 'data: {"choices":[{"delta":{"content":"Hi"}}]}').text, "Hi");
+  assert.ok(/overloaded/.test(S.streamDelta("openrouter", 'data: {"error":{"message":"overloaded"},"choices":[{"delta":{"content":""},"finish_reason":"error"}]}').error));
+  assert.deepStrictEqual(S.streamDelta("local", '{"message":{"content":"Yo"},"done":false}'), { text: "Yo", done: false });
+  assert.strictEqual(S.streamDelta("local", '{"message":{"content":""},"done":true}').done, true);
+  assert.ok(/missing/.test(S.streamDelta("local", '{"error":"model missing"}').error));
+  assert.deepStrictEqual(S.takeLines("a\nb\r\nc"), { lines: ["a", "b"], rest: "c" });
+});
+
+section("Chat: side by side and ask this model (pure)");
+test("side by side renders two labelled columns with status, answer, and error", function () {
+  var left = S.sideColumnHtml("Left", { status: "done", model: VENICE, label: "Venice Uncensored", text: "Paris." });
+  var right = S.sideColumnHtml("Right", { status: "error", model: HERMES, label: "Nous Hermes 3 70B", text: "", error: "OpenRouter returned HTTP 500." });
+  assert.ok(/>Left</.test(left) && /class="side-name">Venice Uncensored</.test(left) && /badge ok">Done</.test(left) && /Paris\./.test(left));
+  assert.ok(/>Right</.test(right) && /class="side-name">Nous Hermes 3 70B</.test(right) && /badge warn">Error</.test(right) && /verdict warn">OpenRouter returned HTTP 500/.test(right));
+  assert.ok(/badge live">Sending</.test(S.sideColumnHtml("Left", { status: "sending", label: "X" })));
+  assert.ok(/No model chosen/.test(S.sideColumnHtml("Right", { status: "idle" })));
+  var cols = pageHtml.match(/<div id="side-cols"[^>]*>[\s\S]*?<\/article>\s*<article[\s\S]*?<\/article>\s*<\/div>/);
+  assert.ok(cols, "side-cols block missing");
+  assert.strictEqual((cols[0].match(/<article id="side-col-[ab]" class="side-col"/g) || []).length, 2, "exactly two columns");
+  assert.ok(/aria-label="Left answer"/.test(cols[0]) && /aria-label="Right answer"/.test(cols[0]));
+  assert.ok(/\.side-cols \{[^}]*grid-template-columns/.test(css) && /@media \(min-width: 40em\) \{ \.side-cols \{ grid-template-columns: repeat\(2/.test(css), "two columns from 40em");
+});
+test("model answers are escaped, never injected as HTML", function () {
+  var h = S.sideColumnHtml("Left", { status: "done", label: "<b>x</b>", text: '<img src=x onerror="alert(1)">' });
+  assert.ok(h.indexOf("<img") < 0 && h.indexOf("<b>") < 0 && /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/.test(h));
+});
+test("ask this model: single mode sets the chat model; side by side fills the first empty slot, else the left", function () {
+  assert.deepStrictEqual(S.askTarget("single", ["a", "b"]), { target: "single" });
+  assert.deepStrictEqual(S.askTarget("side", ["", ""]), { target: "slot", index: 0 });
+  assert.deepStrictEqual(S.askTarget("side", ["a", ""]), { target: "slot", index: 1 });
+  assert.deepStrictEqual(S.askTarget("side", ["", "b"]), { target: "slot", index: 0 });
+  assert.deepStrictEqual(S.askTarget("side", ["a", "b"]), { target: "slot", index: 0 });
+});
+test("every model card gets an Ask this model button wired to the chat", function () {
+  assert.ok(/askButton\(m\) \+\s*"<\/article>"/.test(appJs), "card template ends with the ask button");
+  assert.ok(/class="btn ask-btn" data-ask="' \+ esc\(m\.openrouter_id\)/.test(appJs), "button carries the OpenRouter id");
+  assert.ok(/Ask this model<span class="visually-hidden">: ' \+ esc\(m\.model\)/.test(appJs), "accessible name includes the model");
+  assert.ok(/class="btn ask-btn" disabled aria-describedby=/.test(appJs), "models that cannot chat say why");
+  assert.ok(/\$\("cards"\)\.addEventListener\("click"/.test(appJs) && /closest\("\.ask-btn"\)/.test(appJs), "one delegated click handler");
+});
+
+section("Chat: key box (localStorage only)");
+test("save, read, and forget the key in storage under one name", function () {
+  var st = fakeStorage();
+  assert.strictEqual(S.readKey(st), "");
+  assert.ok(S.saveKey(st, "  " + DUMMY_KEY + " ").ok);
+  assert.strictEqual(st.data[S.KEY_STORAGE], DUMMY_KEY);
+  assert.strictEqual(S.readKey(st), DUMMY_KEY);
+  assert.ok(S.forgetKey(st));
+  assert.strictEqual(S.readKey(st), "");
+  assert.ok(!S.saveKey(st, "   ").ok, "empty key refused");
+  assert.ok(!S.saveKey(st, "two words").ok, "key with spaces refused");
+});
+test("blocked storage never throws and explains itself", function () {
+  var b = blockedStorage();
+  assert.strictEqual(S.readKey(b), "");
+  assert.strictEqual(S.readKey(null), "");
+  var r = S.saveKey(b, DUMMY_KEY);
+  assert.ok(!r.ok && /local storage/.test(r.error));
+  assert.strictEqual(S.forgetKey(b), false);
+});
+test("the key is stored with localStorage only: no cookies, sessionStorage, or IndexedDB", function () {
+  assert.ok(/window\.localStorage/.test(appJs));
+  assert.ok(!/sessionStorage|document\.cookie|indexedDB/.test(appJs));
+  assert.strictEqual((appJs.match(/"Bearer " \+/g) || []).length, 1, "one place builds the Authorization header");
+  assert.ok(/"Authorization": "Bearer " \+ k \}/.test(appJs), "header value comes from the stored key variable");
+});
+test("no hard-coded API key or Bearer token in any file in the repo", function () {
+  var patterns = [
+    /sk-or-v1-[0-9a-f]{16,}/i, /\bsk-[A-Za-z0-9_-]{20,}/, /ghp_[A-Za-z0-9]{20,}/, /github_pat_[A-Za-z0-9_]{20,}/, /AKIA[0-9A-Z]{16}/,
+    /Bearer\s+[A-Za-z0-9._~+\/-]{12,}/, /["']?Authorization["']?\s*:\s*["']Bearer [^"' ]/
+  ];
+  var files = [];
+  (function walk(dir) {
+    fs.readdirSync(dir).forEach(function (n) {
+      if (n === ".git" || n === "node_modules") return;
+      var f = path.join(dir, n), st = fs.lstatSync(f);
+      if (st.isSymbolicLink()) return;
+      if (st.isDirectory()) walk(f); else files.push(f);
+    });
+  })(ROOT);
+  assert.ok(files.length >= 8, "walked " + files.length + " files");
+  files.forEach(function (f) {
+    var text = fs.readFileSync(f, "utf8");
+    patterns.forEach(function (re) { assert.ok(!re.test(text), path.relative(ROOT, f) + " matches " + re); });
+  });
+  assert.ok(!/value="[^"]+"[^>]*id="chat-key"|id="chat-key"[^>]*value="[^"]+"/.test(pageHtml), "key field ships empty");
+});
+test("the UI warns that the key lives in this browser only", function () {
+  assert.ok(/<input id="chat-key" type="password" autocomplete="off"/.test(pageHtml), "key field is a password field without autocomplete");
+  var warn = pageHtml.match(/<p id="chat-key-warning"[^>]*>([\s\S]*?)<\/p>/);
+  assert.ok(warn && /this browser only/.test(warn[1]) && /local storage/.test(warn[1]) && /Authorization header/.test(warn[1]));
+  assert.ok(/aria-describedby="chat-key-warning chat-key-status chat-key-error"/.test(pageHtml), "warning is tied to the field");
+  assert.ok(/function promptForKey\(\)/.test(appJs) && /if \(!key\) \{ promptForKey\(\); return; \}/.test(appJs), "sending without a key prompts for one");
+});
+
+section("Chat: page structure and style");
+var CHAT_IDS = [
+  "chat", "chat-h", "chat-provider-openrouter", "chat-provider-local", "chat-key-box", "chat-key-form", "chat-key", "chat-key-warning",
+  "chat-key-status", "chat-key-error", "chat-key-save", "chat-key-forget", "chat-local-note", "chat-local-check", "chat-stream",
+  "chat-mode-single", "chat-mode-side", "chat-main", "chat-status", "chat-single", "chat-model", "chat-model-note", "chat-log", "chat-form",
+  "chat-input", "chat-send", "chat-clear", "chat-side", "side-form", "side-model-a", "side-model-b", "side-input", "side-send",
+  "side-cols", "side-col-a", "side-col-b"
+];
+test("chat panel, key box, both pickers, and side-by-side columns exist with their IDs exactly once", function () {
+  var ids = htmlIds();
+  CHAT_IDS.forEach(function (id) { assert.strictEqual(ids[id], 1, "#" + id + " found " + (ids[id] || 0) + " times"); });
+  assert.ok(/<a href="#chat"><span class="nav-num">3<\/span> Ask a model<\/a>/.test(pageHtml), "nav link");
+});
+test("provider and mode toggles are labelled radio groups, local mode explains the localhost limit", function () {
+  assert.ok(/<legend>Provider<\/legend>[\s\S]*?name="chat-provider" id="chat-provider-openrouter" value="openrouter" checked[\s\S]*?name="chat-provider" id="chat-provider-local"/.test(pageHtml));
+  assert.ok(/<legend>Mode<\/legend>[\s\S]*?id="chat-mode-single" value="single" checked[\s\S]*?id="chat-mode-side"/.test(pageHtml));
+  var note = pageHtml.match(/<div id="chat-local-note"[^>]*>([\s\S]*?)<\/div>/)[1];
+  assert.ok(/dolphin3/.test(note) && /served from localhost/.test(note) && /public https site cannot call http:\/\/localhost/.test(note) && /ollama pull dolphin3/.test(note));
+  assert.ok(/The Ask a model panel is the only part that calls a model/.test(pageHtml), "about section says what is sent where");
+});
+test("one teal accent: Send buttons are primary, every other chat button is not", function () {
+  assert.ok(/id="chat-send" class="btn primary"/.test(pageHtml) && /id="side-send" class="btn primary"/.test(pageHtml));
+  ["chat-key-save", "chat-key-forget", "chat-clear"].forEach(function (id) {
+    assert.ok(new RegExp('id="' + id + '" class="btn"').test(pageHtml), id + " should be a plain button");
+  });
+  assert.ok(!/class="btn primary ask-btn|class="btn ask-btn primary/.test(appJs), "ask buttons stay plain");
+  var block = css.slice(css.indexOf("/* ---------- ask a model"), css.indexOf("footer.site {"));
+  assert.ok(block.length > 500, "chat CSS block found");
+  assert.ok(!/background: var\(--accent\)/.test(block), "no teal fills in the chat CSS");
+});
+test("chat controls: 44px targets, visible focus on the segmented labels", function () {
+  [/\.seg label \{[^}]*min-height: 44px/, /\.key-box input\[type="password"\] \{[^}]*min-height: 44px/].forEach(function (re) {
+    assert.ok(re.test(css), "missing 44px target: " + re);
+  });
+  assert.ok(/\.seg input:focus-visible \+ label \{[^}]*outline: 3px solid var\(--focus\)/.test(css), "segmented focus ring");
+  assert.ok(/\.key-box input\[type="password"\]:focus-visible \{[^}]*outline: 3px solid var\(--focus\)/.test(css), "key field focus ring");
+  assert.ok(/<div id="chat-log"[^>]*role="log"[^>]*aria-live="polite"[^>]*tabindex="0"/.test(pageHtml), "scrollable log is focusable and announced");
+});
+test("no broken or absolute asset paths in markup that app.js builds", function () {
+  assert.ok(!/(?:src|href)="\//.test(appJs), "absolute path in generated markup");
+  assert.ok(!/fetch\("\//.test(appJs), "absolute fetch path");
+  assert.ok(!/<(?:img|script|link)\b/.test(appJs.replace(/&lt;img/g, "")), "app.js loads no extra assets");
+});
+test("AGENTS.md is a symlink to CLAUDE.md, and CLAUDE.md stays under 60 lines", function () {
+  var a = path.join(ROOT, "AGENTS.md");
+  assert.ok(fs.lstatSync(a).isSymbolicLink(), "AGENTS.md must be a symlink");
+  assert.strictEqual(fs.readlinkSync(a), "CLAUDE.md");
+  assert.ok(fs.readFileSync(path.join(ROOT, "CLAUDE.md"), "utf8").trim().split("\n").length < 60);
+});
+
+// ------------------------------------------------------------------
+// Async engine tests: stubbed fetch only. Run in order after the sync tests.
+var asyncQueue = [];
+function asection(name) { asyncQueue.push({ section: name }); }
+function atest(name, fn) { asyncQueue.push({ name: name, fn: fn }); }
+function runAsync(i) {
+  if (i >= asyncQueue.length) return Promise.resolve();
+  var item = asyncQueue[i];
+  if (item.section) { section(item.section); return runAsync(i + 1); }
+  var timer;
+  var limit = new Promise(function (_, rej) { timer = setTimeout(function () { rej(new Error("timed out after 3s")); }, 3000); });
+  return Promise.race([Promise.resolve().then(item.fn), limit]).then(function () {
+    results.pass++; console.log("  ok   " + item.name);
+  }, function (e) {
+    results.fail++; results.failures.push(group + " > " + item.name + ": " + e.message); console.log("  FAIL " + item.name + "\n       " + e.message);
+  }).then(function () { clearTimeout(timer); return runAsync(i + 1); });
+}
+
+asection("Chat: sending (stubbed fetch, no network)");
+atest("OpenRouter answer is read from choices[0].message.content", function () {
+  var f = recorder(function () { return Promise.resolve(jsonRes(orAnswer("Paris."))); });
+  return S.sendChat(f, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false)).then(function (r) {
+    assert.deepStrictEqual([r.ok, r.text], [true, "Paris."]);
+    assert.strictEqual(f.calls.length, 1);
+    assert.strictEqual(f.calls[0].url, S.OPENROUTER_CHAT_URL);
+    assert.strictEqual(f.calls[0].init.headers.Authorization, "Bearer " + DUMMY_KEY);
+    assert.ok(f.calls[0].init.signal, "request can be stopped by the timeout");
+  });
+});
+atest("local answer is read from message.content, sent to localhost with dolphin3 and stream false", function () {
+  var f = recorder(function () { return Promise.resolve(jsonRes(ollamaAnswer("Hi from Ollama"))); });
+  return S.sendChat(f, S.buildChatRequest("local", "", MSGS, "", false)).then(function (r) {
+    assert.ok(r.ok && r.text === "Hi from Ollama");
+    assert.strictEqual(f.calls[0].url, "http://localhost:11434/api/chat");
+    assert.deepStrictEqual(f.calls[0].body, { model: "dolphin3", messages: MSGS, stream: false });
+  });
+});
+atest("without a key, fetch is never called", function () {
+  var f = recorder(function () { throw new Error("must not be called"); });
+  return S.sendChat(f, S.buildChatRequest("openrouter", VENICE, MSGS, "", false)).then(function (r) {
+    assert.ok(!r.ok && /key/i.test(r.error));
+    assert.strictEqual(f.calls.length, 0);
+  });
+});
+atest("HTTP 401 explains the key problem and quotes OpenRouter's message", function () {
+  var f = recorder(function () { return Promise.resolve(jsonRes({ error: { message: "No auth credentials found", code: 401 } }, 401)); });
+  return S.sendChat(f, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false)).then(function (r) {
+    assert.ok(!r.ok && r.status === 401 && /rejected the key/.test(r.error) && /No auth credentials found/.test(r.error));
+  });
+});
+atest("network failure never rejects; local mode names localhost and where the page is served from", function () {
+  var f = recorder(function () { return Promise.reject(new TypeError("Failed to fetch")); });
+  return S.sendChat(f, S.buildChatRequest("local", "", MSGS, "", false), { pageUrl: "https://battlettt.github.io/model-scout/" }).then(function (r) {
+    assert.ok(!r.ok && /Could not reach Ollama on localhost port 11434/.test(r.error) && /battlettt\.github\.io/.test(r.error));
+    return S.sendChat(f, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false));
+  }).then(function (r) { assert.ok(!r.ok && /Could not reach OpenRouter/.test(r.error)); });
+});
+atest("a fetch that throws synchronously is handled like a network failure", function () {
+  var f = function () { throw new TypeError("blocked by policy"); };
+  return S.sendChat(f, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false)).then(function (r) {
+    assert.ok(!r.ok && /blocked by policy/.test(r.error));
+  });
+});
+atest("unreadable, error-bearing, or empty 200 responses are errors, not blank answers", function () {
+  var cases = [
+    [badJsonRes(), /not valid JSON/], [jsonRes({ nothing: true }), /did not contain an answer/],
+    [jsonRes(orAnswer("   ")), /empty answer/], [jsonRes({ error: { message: "Provider returned error" } }), /reported an error: Provider returned error/]
+  ];
+  return cases.reduce(function (p, c) {
+    return p.then(function () {
+      return S.sendChat(function () { return Promise.resolve(c[0]); }, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false)).then(function (r) {
+        assert.ok(!r.ok && c[1].test(r.error), r.error);
+      });
+    });
+  }, Promise.resolve());
+});
+atest("timeout: a request with no answer is stopped with a clear message", function () {
+  var f = function (url, init) {
+    return new Promise(function (_, rej) {
+      init.signal.addEventListener("abort", function () { var e = new Error("aborted"); e.name = "AbortError"; rej(e); });
+    });
+  };
+  return S.sendChat(f, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false), { timeoutMs: 30 }).then(function (r) {
+    assert.ok(!r.ok && /request was stopped/.test(r.error));
+  });
+});
+atest("streaming: OpenRouter events split across chunks render token by token", function () {
+  var chunks = [": OPENROUTER PROCESSING\n\n", 'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\ndata: {"choi', 'ces":[{"delta":{"content":"lo"}}]}\n\n', 'data: {"choices":[{"delta":{"content":" world"}}]}\n\ndata: [DONE]\n\n'];
+  var seen = [];
+  return S.sendChat(function () { return Promise.resolve(streamRes(chunks)); }, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, true), {
+    onDelta: function (t) { seen.push(t); }
+  }).then(function (r) {
+    assert.ok(r.ok && r.text === "Hello world", JSON.stringify(r));
+    assert.deepStrictEqual(seen, ["Hel", "Hello", "Hello world"]);
+  });
+});
+atest("streaming: Ollama JSON lines, and a final line without a newline", function () {
+  var chunks = ['{"message":{"content":"Lo"},"done":false}\n{"message":{"content":"cal"},', '"done":false}\n{"message":{"content":"!"},"done":true}'];
+  return S.sendChat(function () { return Promise.resolve(streamRes(chunks)); }, S.buildChatRequest("local", "", MSGS, "", true)).then(function (r) {
+    assert.ok(r.ok && r.text === "Local!", JSON.stringify(r));
+  });
+});
+atest("streaming: an error mid-stream keeps the partial answer and stops reading", function () {
+  var res = streamRes(['data: {"choices":[{"delta":{"content":"Partial"}}]}\n', 'data: {"error":{"message":"upstream died"}}\n', 'data: {"choices":[{"delta":{"content":"NEVER"}}]}\n']);
+  return S.sendChat(function () { return Promise.resolve(res); }, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, true)).then(function (r) {
+    assert.ok(!r.ok && r.text === "Partial" && /upstream died/.test(r.error), JSON.stringify(r));
+    assert.ok(res.reader.cancelled, "reader cancelled after the error");
+  });
+});
+atest("streaming: a stream that stalls is stopped by the idle timeout and keeps the partial answer", function () {
+  var enc = new TextEncoder();
+  var f = function (url, init) {
+    var first = true;
+    return Promise.resolve({ ok: true, status: 200, body: { getReader: function () {
+      return { read: function () {
+        if (first) { first = false; return Promise.resolve({ done: false, value: enc.encode('data: {"choices":[{"delta":{"content":"Half an"}}]}\n') }); }
+        return new Promise(function (_, rej) { init.signal.addEventListener("abort", function () { var e = new Error("aborted"); e.name = "AbortError"; rej(e); }); });
+      }, cancel: function () {} };
+    } } });
+  };
+  return S.sendChat(f, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, true), { timeoutMs: 30 }).then(function (r) {
+    assert.ok(!r.ok && r.text === "Half an" && /request was stopped/.test(r.error), JSON.stringify(r));
+  });
+});
+atest("streaming falls back to reading the whole body when there is no stream reader", function () {
+  var body = 'data: {"choices":[{"delta":{"content":"Whole"}}]}\n\ndata: {"choices":[{"delta":{"content":" body"}}]}\n\ndata: [DONE]\n';
+  return S.sendChat(function () { return Promise.resolve(textRes(body)); }, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, true)).then(function (r) {
+    assert.ok(r.ok && r.text === "Whole body", JSON.stringify(r));
+  });
+});
+atest("the non-streaming path is untouched by streaming support", function () {
+  var f = recorder(function () { return Promise.resolve(jsonRes(orAnswer("plain"))); });
+  return S.sendChat(f, S.buildChatRequest("openrouter", VENICE, MSGS, DUMMY_KEY, false), { onDelta: function () { throw new Error("no deltas without streaming"); } })
+    .then(function (r) { assert.ok(r.ok && r.text === "plain"); assert.ok(!("stream" in f.calls[0].body)); });
+});
+
+asection("Chat: side by side (stubbed fetch)");
+function sideCols(key) {
+  return [
+    { model: VENICE, label: "Venice Uncensored", req: S.buildChatRequest("openrouter", VENICE, MSGS, key, false) },
+    { model: HERMES, label: "Nous Hermes 3 70B", req: S.buildChatRequest("openrouter", HERMES, MSGS, key, false) }
+  ];
+}
+atest("both requests fire in parallel, before either answers", function () {
+  var release = [];
+  var f = recorder(function () { return new Promise(function (res) { release.push(res); }); });
+  var done = S.runCompare(f, sideCols(DUMMY_KEY), null);
+  assert.strictEqual(f.calls.length, 2, "both fetches started at once");
+  assert.deepStrictEqual(f.calls.map(function (c) { return c.body.model; }), [VENICE, HERMES]);
+  release.forEach(function (r, i) { r(jsonRes(orAnswer("answer " + i))); });
+  return done.then(function (cols) { assert.deepStrictEqual(cols.map(function (c) { return c.text; }), ["answer 0", "answer 1"]); });
+});
+atest("one column fails (HTTP 500), the other answer is kept; statuses go sending then done or error", function () {
+  var log = [];
+  var f = recorder(function (url, init) {
+    return JSON.parse(init.body).model === HERMES ? Promise.resolve(jsonRes({ error: { message: "upstream" } }, 500)) : Promise.resolve(jsonRes(orAnswer("Left answer")));
+  });
+  return S.runCompare(f, sideCols(DUMMY_KEY), function (i, st) { log.push(i + ":" + st.status); }).then(function (cols) {
+    assert.strictEqual(cols[0].status, "done");
+    assert.strictEqual(cols[0].text, "Left answer");
+    assert.strictEqual(cols[1].status, "error");
+    assert.ok(/HTTP 500/.test(cols[1].error) && /upstream/.test(cols[1].error));
+    assert.deepStrictEqual(log.filter(function (s) { return s[0] === "0"; }), ["0:sending", "0:done"]);
+    assert.deepStrictEqual(log.filter(function (s) { return s[0] === "1"; }), ["1:sending", "1:error"]);
+    var html = S.sideColumnHtml("Left", cols[0]) + S.sideColumnHtml("Right", cols[1]);
+    assert.ok(/Left answer/.test(html) && /badge ok">Done/.test(html) && /badge warn">Error/.test(html));
+  });
+});
+atest("a network failure on the left does not block a streamed answer on the right", function () {
+  var cols = sideCols(DUMMY_KEY);
+  cols[1].req = S.buildChatRequest("openrouter", HERMES, MSGS, DUMMY_KEY, true);
+  var f = function (url, init) {
+    return JSON.parse(init.body).model === VENICE ? Promise.reject(new TypeError("Failed to fetch"))
+      : Promise.resolve(streamRes(['data: {"choices":[{"delta":{"content":"Right "}}]}\n', 'data: {"choices":[{"delta":{"content":"side"}}]}\n']));
+  };
+  return S.runCompare(f, cols, null).then(function (res) {
+    assert.ok(res[0].status === "error" && /Could not reach OpenRouter/.test(res[0].error));
+    assert.ok(res[1].status === "done" && res[1].text === "Right side");
+  });
+});
+atest("an empty slot errors on its own and the other column still runs", function () {
+  var cols = sideCols(DUMMY_KEY);
+  cols[0] = { model: "", label: "", req: null };
+  var f = recorder(function () { return Promise.resolve(jsonRes(orAnswer("only right"))); });
+  return S.runCompare(f, cols, null).then(function (res) {
+    assert.ok(res[0].status === "error" && /No model chosen/.test(res[0].error));
+    assert.ok(res[1].status === "done" && res[1].text === "only right");
+    assert.strictEqual(f.calls.length, 1);
+  });
+});
+atest("a render error in one column does not stop the other", function () {
+  var f = function () { return Promise.resolve(jsonRes(orAnswer("fine"))); };
+  var rendered = [];
+  return S.runCompare(f, sideCols(DUMMY_KEY), function (i, st) { if (i === 0) throw new Error("render broke"); rendered.push(st.status); }).then(function (res) {
+    assert.deepStrictEqual(res.map(function (c) { return c.status; }), ["done", "done"]);
+    assert.deepStrictEqual(rendered, ["sending", "done"]);
+  });
+});
+
+// ------------------------------------------------------------------
 // DOM smoke tests run in a child process (they are async and need jsdom, which is optional).
-section("DOM smoke tests (jsdom, see tests/dom_smoke.js)");
-(function () {
+function domSmoke() {
+  section("DOM smoke tests (jsdom, see tests/dom_smoke.js)");
   var r = require("child_process").spawnSync(process.execPath, [path.join(__dirname, "dom_smoke.js")], { encoding: "utf8", env: process.env, timeout: 120000 });
   var out = (r.stdout || "") + (r.stderr || "");
   if (/^SKIP/m.test(out)) { console.log("  skip jsdom not installed (set NODE_PATH to a node_modules with jsdom to run them)"); return; }
@@ -678,8 +1137,12 @@ section("DOM smoke tests (jsdom, see tests/dom_smoke.js)");
     results.failures.push("DOM smoke: " + (m ? failed + " failed" : "did not finish: " + out.slice(-300)));
   }
   if (m) results.pass += parseInt(m[1], 10);
-})();
+}
 
 // ------------------------------------------------------------------
-console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");
-if (results.fail) { console.log(results.failures.join("\n")); process.exit(1); }
+runAsync(0).then(function () {
+  domSmoke();
+  console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");
+  if (results.fail) { console.log(results.failures.join("\n")); process.exit(1); }
+  process.exit(0);
+});
