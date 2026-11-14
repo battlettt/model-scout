@@ -668,6 +668,29 @@ test("test kit: lists the shortlist plus the split pick, downloads a script, and
   });
 });
 
+test("pinned scenario: pin, change settings, see what changed, go back, unpin", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
+  var copied = null;
+  Object.defineProperty(p.w.navigator, "clipboard", { value: { writeText: function (t) { copied = t; return Promise.resolve(); } }, configurable: true });
+  function top() { return p.d.querySelector("#top-pick h3").firstChild.textContent.trim(); }
+  return settled(p).then(function () {
+    ok(p.$("pin-bar").hidden, "bar starts hidden");
+    p.$("pin-btn").click();
+    ok(!p.$("pin-bar").hidden && /No settings changed/.test(p.$("pin-diff").textContent) && p.$("pin-restore").disabled, "fresh pin: " + p.$("pin-diff").textContent);
+    p.$("monthly-cap").value = "100"; fire(p, "monthly-cap");
+    ok(/Monthly spend limit: none to \$100 a month/.test(p.$("pin-diff").textContent), "diff: " + p.$("pin-diff").textContent);
+    ok(/^Pinned: Grok 4\.7, score 85, \$138 a month\. Now: DeepSeek V4\.1 Flash/.test(p.$("pin-text").textContent), "text: " + p.$("pin-text").textContent);
+    p.$("memo-copy").click();
+    return waitFor(function () { return copied; }, "clipboard write");
+  }).then(function () {
+    ok(/## Compared with the pinned scenario\nPinned: Grok 4\.7[\s\S]*- Monthly spend limit: none to \$100 a month/.test(copied), "memo: " + copied.slice(0, 300));
+    p.$("pin-restore").click();
+    ok(p.$("monthly-cap").value === "" && top() === "Grok 4.7" && /No settings changed/.test(p.$("pin-diff").textContent), "restore: " + top());
+    p.$("pin-clear").click();
+    ok(p.$("pin-bar").hidden && p.d.activeElement === p.$("pin-btn"), "unpin");
+  });
+});
+
 test("split traffic: pick a cheaper model and a share, see the cost, and the memo carries it", function () {
   var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
   var copied = null;

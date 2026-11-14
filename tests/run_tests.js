@@ -987,6 +987,34 @@ test("the CSV has one row per ranked model, quotes commas and quotes, and defuse
   assert.ok(/,100,,1,4,1000000,/.test(S.tableCsv(local, lp).split("\r\n")[1]), "no monthly cost for local only: " + S.tableCsv(local, lp));
 });
 
+section("Pinned scenario");
+test("settingsDiff lists only what changed, in form order, in plain words", function () {
+  var a = S.presetSettings("contracts");
+  assert.deepStrictEqual(S.settingsDiff(a, a), []);
+  var b = Object.assign({}, a, { zdr: true, monthlyCap: 100, quality: "good", cacheShare: 0.5 });
+  assert.deepStrictEqual(S.settingsDiff(a, b), [
+    "Quality bar: frontier (hardest work) to good (most production work)",
+    "Monthly spend limit: none to $100 a month",
+    "Prompt cache share: 0% to 50%",
+    "Zero data retention: off to on"
+  ]);
+  var w = S.settingsDiff(a, Object.assign({}, a, { weights: { cost: 2, quality: 1, latency: 1, context: 0, privacy: 0 } }));
+  assert.deepStrictEqual(w, ["Weights: from the profile to set by hand (cost 50%, quality 25%, speed 25%, context fit 0%, privacy 0%)"]);
+  assert.strictEqual(S.settingText("contextNeed", 400000), "400K tokens");
+  assert.strictEqual(S.settingText("budget", null), "none");
+});
+test("pinText compares the pinned pick with the current one", function () {
+  var g = { id: "g", name: "Grok 4.7", total: 85, cost: 138 }, d = { id: "d", name: "DeepSeek V4.1 Flash", total: 53.2, cost: 7.73 };
+  assert.strictEqual(S.pinText(g, d), "Pinned: Grok 4.7, score 85, $138 a month. Now: DeepSeek V4.1 Flash, score 53.2, $7.73 a month. A different pick, $130 a month less.");
+  assert.ok(/Same pick, same monthly cost\.$/.test(S.pinText(g, g)));
+  assert.ok(/A different pick, \$130 a month more\.$/.test(S.pinText(d, g)));
+  assert.ok(/Now: no model passes the hard constraints\.$/.test(S.pinText(g, null)));
+  assert.ok(/self-hosted\. Same pick\.$/.test(S.pinText(g, { id: "g", name: "Grok 4.7", total: 85, cost: null })));
+  var p = profile(), res = S.rankModels([mk({ id: "x", model: "X" })], p, NOW);
+  assert.deepStrictEqual(S.pickSummary(res, p), { id: "x", name: "X", total: res.ranked[0].total, cost: 90 });
+  assert.strictEqual(S.pickSummary({ ranked: [] }, p), null);
+});
+
 section("What if one constraint changed");
 test("lever options change one setting and keep the rest", function () {
   var base = S.presetSettings("coding-agent"), opts = S.leverOptions(base);
