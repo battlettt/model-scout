@@ -247,10 +247,10 @@
 
       <div class="sub-head">
         <h3>Value map</h3>
-        <p class="muted">Every ranked model by score and monthly cost at your volume. The line joins the models that nothing else beats on both, so anything under it costs more for a lower score. Point at a dot to name it; select one to open its card.</p>
+        <p class="muted">Every ranked model by score and monthly cost at your volume. The line joins the models that nothing else beats on both, so anything under it costs more for a lower score. Point at a dot to name it; select one to open its card. With a keyboard, focus the map, step with the arrow keys (left and right by cost, up and down by score), and press Enter to open the card.</p>
       </div>
       <figure id="value-map-fig" class="value-map panel">
-        <div id="value-map" class="vm-plot"><p class="muted">The map appears once the ranking loads.</p></div>
+        <div id="value-map" class="vm-plot" tabindex="0" role="group" aria-label="Value map. Arrow keys step between models, Enter opens the card." aria-describedby="value-map-readout"><p class="muted">The map appears once the ranking loads.</p></div>
         <figcaption id="value-map-readout" class="vm-readout" aria-live="polite"></figcaption>
       </figure>
 

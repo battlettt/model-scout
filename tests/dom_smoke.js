@@ -614,6 +614,34 @@ test("what if: levers show under the pick; apply one, then undo it", function ()
   });
 });
 
+test("value map keyboard: focus lands on the top pick, arrows step by cost and score, Enter opens the card", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    var map = p.$("value-map"), out = p.$("value-map-readout");
+    ok(map.getAttribute("tabindex") === "0" && /Arrow keys/.test(map.getAttribute("aria-label")), "map should be focusable and say how to use it");
+    function key(k) { map.dispatchEvent(new p.w.KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true })); }
+    function cursor() { var c = map.querySelector("circle.is-cursor"); return c && c.getAttribute("data-id"); }
+    map.dispatchEvent(new p.w.FocusEvent("focus"));
+    var top = p.d.querySelector("#top-pick h3").firstChild.textContent.trim();
+    ok(cursor() && out.textContent.indexOf("#1 " + top) === 0, "focus should start on the top pick: " + out.textContent);
+    key("Home");
+    var cheapest = cursor();
+    key("ArrowLeft");
+    ok(cursor() === cheapest, "left at the cheapest end should stay put");
+    key("ArrowRight");
+    ok(cursor() && cursor() !== cheapest, "right should move to a pricier model");
+    key("End"); var last = cursor(); key("ArrowRight");
+    ok(cursor() === last, "right at the far end should stay put");
+    key("ArrowUp"); key("ArrowDown");
+    ok(/score \d/.test(out.textContent), "readout should name the model: " + out.textContent);
+    var id = cursor(); key("Enter");
+    var card = p.$("card-" + id);
+    ok(card && !card.hidden && p.d.activeElement === card, "Enter should open and focus the card for " + id);
+    map.dispatchEvent(new p.w.FocusEvent("focus")); key("Escape");
+    ok(!cursor() && !/score \d/.test(out.textContent), "Escape should clear the cursor");
+  });
+});
+
 (function run(i) {
   if (i >= cases.length) {
     console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");
