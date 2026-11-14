@@ -474,6 +474,62 @@ test("volume helper: requests per day fill the monthly volume fields", function 
   });
 });
 
+test("value map: one dot per ranked model; hover names it; selecting a folded model opens its card", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    var dots = p.d.querySelectorAll("#value-map circle[data-id]");
+    ok(dots.length === p.d.querySelectorAll("#compare-body tr").length, "dots " + dots.length);
+    ok(p.d.querySelector("#value-map svg[role=img] title") && /sit on the frontier/.test(p.$("value-map-readout").textContent), "map not labelled");
+    var lastRow = p.d.querySelectorAll("#compare-body tr th a"), id = lastRow[lastRow.length - 1].getAttribute("href").slice(6);
+    var dot = p.d.querySelector('#value-map circle[data-id="' + id + '"]');
+    dot.dispatchEvent(new p.w.MouseEvent("mouseover", { bubbles: true }));
+    ok(/score/.test(p.$("value-map-readout").textContent) && /a month/.test(p.$("value-map-readout").textContent), "readout: " + p.$("value-map-readout").textContent);
+    ok(p.$("card-" + id).hidden, "card should start folded");
+    dot.dispatchEvent(new p.w.MouseEvent("click", { bubbles: true }));
+    ok(!p.$("card-" + id).hidden, "clicking a dot left the card folded");
+    p.$("vol-in").value = "0"; fire(p, "vol-in"); p.$("vol-out").value = "0"; fire(p, "vol-out");
+    ok(/Set a monthly volume/.test(p.$("value-map").textContent), "zero volume should explain the empty map");
+  });
+});
+
+test("compare: tray and head to head; a fourth pick drops the oldest; ask both side by side", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    var btns = p.d.querySelectorAll("#cards .compare-btn");
+    btns[0].click();
+    ok(!p.$("compare-tray").hidden && p.$("h2h").hidden && /Pick one or two more/.test(p.$("compare-tray-text").textContent), "one pick: tray only");
+    btns[1].click();
+    ok(!p.$("h2h").hidden && p.d.querySelectorAll("#h2h-table thead th").length === 3, "two picks: table with two model columns");
+    ok(p.d.querySelectorAll("#h2h-table .is-best").length > 0 && /best/.test(p.$("h2h-table").textContent), "no best marks");
+    btns = p.d.querySelectorAll("#cards .compare-btn");
+    btns[2].click(); btns[3].click();
+    ok(p.d.querySelectorAll("#h2h-table thead th").length === 4 && /was taken out/.test(p.$("compare-tray-text").textContent), "fourth pick should drop the oldest");
+    ok(p.d.querySelectorAll('#cards .compare-btn[aria-pressed="true"]').length === 3, "pressed state out of sync");
+    p.d.querySelector("#h2h-table .h2h-remove").click();
+    ok(p.d.querySelectorAll("#h2h-table thead th").length === 3, "remove from the table");
+    p.$("h2h-ask").click();
+    ok(p.$("chat-mode-side").checked && !p.$("chat-side").hidden && p.$("side-model-a").value && p.$("side-model-b").value && p.$("side-model-a").value !== p.$("side-model-b").value, "side by side not set up");
+    ok(p.d.activeElement === p.$("side-input"), "focus should land on the question box");
+    p.$("compare-tray-clear").click();
+    ok(p.$("compare-tray").hidden && p.$("h2h").hidden && !p.d.body.classList.contains("has-tray"), "clear did not reset");
+  });
+});
+
+test("decision memo: copy puts Markdown on the clipboard; cheaper option shows under the top pick", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?quality=basic&speed=any&context=8000&budget=0.5&in=400&out=20&batch=1&json=1" });
+  var copied = null;
+  Object.defineProperty(p.w.navigator, "clipboard", { value: { writeText: function (t) { copied = t; return Promise.resolve(); } }, configurable: true });
+  return settled(p).then(function () {
+    ok(p.$("top-pick").querySelector(".alt-pick") && /Cheaper option within 5 points/.test(p.$("top-pick").textContent), "cheaper option missing");
+    p.$("task-desc").value = "Tag product reviews";
+    p.$("memo-copy").click();
+    return waitFor(function () { return copied; }, "clipboard write");
+  }).then(function () {
+    ok(/^# Model choice: Tag product reviews/.test(copied) && /## Shortlist/.test(copied) && /Settings: http:\/\/localhost:8000\/model-scout\/index\.html\?/.test(copied), "memo text: " + copied.slice(0, 200));
+    ok(/Decision memo copied/.test(p.$("share-status").textContent), "status: " + p.$("share-status").textContent);
+  });
+});
+
 (function run(i) {
   if (i >= cases.length) {
     console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");

@@ -202,6 +202,8 @@
         <p id="result-count" class="block-lede readout" aria-live="polite">Ranking will appear once the catalog loads.</p>
         <div class="share-row">
           <button type="button" id="share-link" class="btn">Copy link to this ranking</button>
+          <button type="button" id="memo-copy" class="btn">Copy decision memo</button>
+          <button type="button" id="memo-download" class="btn">Download memo (.md)</button>
           <span id="share-status" class="muted" aria-live="polite"></span>
         </div>
       </div>
@@ -218,6 +220,15 @@
           <p class="muted small-print">Weights shift with your constraints: a tight budget raises cost, a long input raises context fit, local-only raises privacy.</p>
         </aside>
       </div>
+
+      <div class="sub-head">
+        <h3>Value map</h3>
+        <p class="muted">Every ranked model by score and monthly cost at your volume. The line joins the models that nothing else beats on both, so anything under it costs more for a lower score. Point at a dot to name it; select one to open its card.</p>
+      </div>
+      <figure id="value-map-fig" class="value-map panel">
+        <div id="value-map" class="vm-plot"><p class="muted">The map appears once the ranking loads.</p></div>
+        <figcaption id="value-map-readout" class="vm-readout" aria-live="polite"></figcaption>
+      </figure>
 
       <div class="toolbar">
         <div class="check">
@@ -245,6 +256,20 @@
           </tbody>
         </table>
       </div>
+
+      <section id="h2h" class="h2h" aria-labelledby="h2h-h" tabindex="-1" hidden>
+        <div class="sub-head">
+          <h3 id="h2h-h">Head to head</h3>
+          <p id="h2h-lede" class="muted">The models you picked with Compare. The better figure in each row is marked.</p>
+        </div>
+        <div class="h2h-wrap" tabindex="0" role="region" aria-labelledby="h2h-h">
+          <table class="h2h-table" id="h2h-table"></table>
+        </div>
+        <div class="row h2h-actions">
+          <button type="button" id="h2h-ask" class="btn primary">Ask the first two side by side</button>
+          <button type="button" id="h2h-clear" class="btn">Clear the comparison</button>
+        </div>
+      </section>
 
       <div class="sub-head">
         <h3>Model cards</h3>
@@ -438,6 +463,11 @@
         <li>The Ask a model panel is the only part that calls a model, and only when you press Send. With OpenRouter it sends your messages and your own key straight from your browser to openrouter.ai, and OpenRouter and the model provider handle them under their own policies. With Local Ollama it sends them to Ollama on your computer. Your key stays in this browser's local storage; conversations are not saved anywhere and are gone when you reload.</li>
       </ul>
     </section>
+    <div id="compare-tray" class="compare-tray" role="region" aria-label="Compare tray" hidden>
+      <p id="compare-tray-text" class="compare-tray-text"></p>
+      <a id="compare-tray-go" class="btn primary" href="#h2h">View head to head</a>
+      <button type="button" id="compare-tray-clear" class="btn">Clear</button>
+    </div>
   </main>
 
   <footer class="site">

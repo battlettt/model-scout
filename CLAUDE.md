@@ -13,6 +13,8 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - Presets (seven common cases) and shareable links: the form settings live in the query string (`encodeSettings` / `decodeSettings`); the task description never does.
 - Hard capability constraints (tool calling, JSON output, reasoning mode), prompt-cache share and batch prices in the cost math, retirement dates as warnings.
 - Confidence check on the top pick (`robustness`): 300 seeded reruns with each weight scaled between half and double; reports ties and dominated runners-up.
+- Value map (`valueMapSvg`, `frontier`): score against monthly cost on a log scale, with the Pareto frontier; drawn at the container width. "Cheaper option within 5 points" under the top pick (`cheaperAlternative`).
+- Compare tray and head to head (`headToHead`, up to 3 models), with "Ask the first two side by side". Decision memo as Markdown (`decisionMemo`): copy or download; it includes the description, the share link does not.
 
 ## Run
 - Open `index.html` directly, or serve the repo root: `python3 -m http.server 8000`.

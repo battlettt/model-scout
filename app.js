@@ -432,6 +432,234 @@
     };
   }
 
+  // ---------- value map: score against monthly cost ----------
+  /** Pareto frontier for "higher score, lower cost": ids of points that no other point beats on both, in cost order. */
+  function frontier(points) {
+    var best = -Infinity, out = [];
+    (points || []).filter(function (q) { return q && isNum(q.cost) && isNum(q.score); }).slice()
+      .sort(function (a, b) { return a.cost - b.cost || b.score - a.score; })
+      .forEach(function (q) { if (q.score > best) { out.push(q.id); best = q.score; } });
+    return out;
+  }
+
+  /** The cheapest ranked model within `gap` points (default 5) of the top pick that costs less per month, or null. */
+  function cheaperAlternative(ranked, p, gap) {
+    if (!ranked || ranked.length < 2 || p.localOnly) return null;
+    var g = isNum(gap) ? gap : SWITCH_MARGIN, top = ranked[0];
+    var topCost = monthlyCost(top.model, p.inputTokens, p.outputTokens, p);
+    if (topCost === null || topCost <= 0) return null;
+    var best = null;
+    ranked.slice(1).forEach(function (r) {
+      if (top.total - r.total > g) return;
+      var c = monthlyCost(r.model, p.inputTokens, p.outputTokens, p);
+      if (c === null || topCost - c < 0.01) return;
+      if (!best || c < best.cost || (c === best.cost && r.total > best.r.total)) best = { r: r, cost: c };
+    });
+    if (!best) return null;
+    return { model: best.r.model, total: best.r.total, rank: best.r.rank, cost: best.cost, topCost: topCost,
+      saves: topCost - best.cost, gap: round(top.total - best.r.total, 1) };
+  }
+
+  /**
+   * SVG for the value map. points: [{ id, name, cost, score, top }]. Cost uses a log scale; points with no cost
+   * are left out and counted. Pure string output, so it can be tested without a browser.
+   */
+  function valueMapSvg(points, opts) {
+    opts = opts || {};
+    // Drawn at the container's own width so 12px text stays 12px on a phone; 720 wide when the width is unknown.
+    var W = isNum(opts.width) && opts.width > 0 ? Math.round(clamp(opts.width, 300, 1100)) : 720;
+    var H = W < 560 ? Math.round(W * 0.8) : Math.round(clamp(W * 0.48, 300, 400)), L = 56, R = 20, T = 18, B = 52;
+    var pts = (points || []).filter(function (q) { return isNum(q.cost) && isNum(q.score); });
+    if (!pts.length) return { svg: "", plotted: 0, skipped: (points || []).length, frontier: [] };
+    var pos = pts.map(function (q) { return q.cost; }).filter(function (c) { return c > 0; });
+    var minPos = pos.length ? Math.min.apply(null, pos) : 1;
+    var floor = minPos / 2;
+    var lo = Math.log10(Math.max(floor, 1e-6)), hi = Math.log10(Math.max(Math.max.apply(null, pts.map(function (q) { return q.cost; })), minPos));
+    lo = Math.floor(lo * 2) / 2; hi = Math.ceil(hi * 2) / 2;
+    if (hi - lo < 1) { lo -= 0.5; hi += 0.5; }
+    var sMin = Math.min.apply(null, pts.map(function (q) { return q.score; }));
+    var yLo = Math.max(0, Math.floor((sMin - 5) / 10) * 10), yHi = 100;
+    function x(c) { return L + (Math.log10(Math.max(c, floor)) - lo) / (hi - lo) * (W - L - R); }
+    function y(s) { return T + (yHi - s) / (yHi - yLo) * (H - T - B); }
+    function f1(v) { return Math.round(v * 10) / 10; }
+    var front = frontier(pts), onFront = {};
+    front.forEach(function (id) { onFront[id] = true; });
+    var out = [];
+    // grid and axes
+    for (var g = yLo; g <= yHi; g += 10) {
+      out.push('<line class="vm-grid" x1="' + L + '" x2="' + (W - R) + '" y1="' + f1(y(g)) + '" y2="' + f1(y(g)) + '"/>');
+      out.push('<text class="vm-tick" x="' + (L - 8) + '" y="' + f1(y(g) + 4) + '" text-anchor="end">' + g + "</text>");
+    }
+    for (var d = Math.ceil(lo); d <= Math.floor(hi); d++) {
+      var xv = f1(x(Math.pow(10, d)));
+      out.push('<line class="vm-grid" x1="' + xv + '" x2="' + xv + '" y1="' + T + '" y2="' + (H - B) + '"/>');
+      var tv = Math.pow(10, d);
+      out.push('<text class="vm-tick" x="' + xv + '" y="' + (H - B + 18) + '" text-anchor="middle">' + (tv >= 1000 ? "$" + (tv / 1000) + "K" : "$" + String(round(tv, 4))) + "</text>");
+    }
+    out.push('<text class="vm-axis" x="' + ((L + W - R) / 2) + '" y="' + (H - 8) + '" text-anchor="middle">' + escapeHtml(opts.xLabel || "Monthly cost at your volume (log scale)") + "</text>");
+    out.push('<text class="vm-axis" x="14" y="' + ((T + H - B) / 2) + '" text-anchor="middle" transform="rotate(-90 14 ' + ((T + H - B) / 2) + ')">Score</text>');
+    // frontier staircase
+    var fp = front.map(function (id) { return pts.filter(function (q) { return q.id === id; })[0]; });
+    if (fp.length > 1) {
+      var dPath = "M" + f1(x(fp[0].cost)) + " " + f1(y(fp[0].score));
+      for (var i = 1; i < fp.length; i++) dPath += " H" + f1(x(fp[i].cost)) + " V" + f1(y(fp[i].score));
+      out.push('<path class="vm-front" d="' + dPath + '"/>');
+    }
+    // points: others first, then the frontier, then the top pick on top
+    var order = pts.slice().sort(function (a, b) { return (onFront[a.id] ? 1 : 0) - (onFront[b.id] ? 1 : 0) || (a.top ? 1 : 0) - (b.top ? 1 : 0); });
+    order.forEach(function (q) {
+      var cls = "vm-pt" + (onFront[q.id] ? " is-front" : "") + (q.top ? " is-top" : "");
+      out.push('<circle class="' + cls + '" data-id="' + escapeHtml(q.id) + '" cx="' + f1(x(q.cost)) + '" cy="' + f1(y(q.score)) + '" r="' + (q.top ? 7 : onFront[q.id] ? 5.5 : 4.5) + '"><title>' +
+        escapeHtml(q.name + ": score " + q.score + ", " + fmtMoney(q.cost) + " a month") + "</title></circle>");
+    });
+    // labels for frontier points and the top pick, skipped where they would collide
+    var boxes = [];
+    function free(bx) { return boxes.every(function (o) { return bx.x2 < o.x1 || bx.x1 > o.x2 || bx.y2 < o.y1 || bx.y1 > o.y2; }); }
+    pts.filter(function (q) { return onFront[q.id] || q.top; }).sort(function (a, b) { return (b.top ? 1 : 0) - (a.top ? 1 : 0); }).forEach(function (q) {
+      var px = x(q.cost), py = y(q.score), w = q.name.length * 6.6 + 4, tries = [[10, -8, "start"], [-10, -8, "end"], [10, 16, "start"], [-10, 16, "end"]];
+      for (var k = 0; k < tries.length; k++) {
+        var t = tries[k], lx = px + t[0], ly = py + t[1];
+        var bx = t[2] === "start" ? { x1: lx, x2: lx + w } : { x1: lx - w, x2: lx };
+        bx.y1 = ly - 11; bx.y2 = ly + 3;
+        if (bx.x1 < L || bx.x2 > W - 4 || bx.y1 < 0 || bx.y2 > H - B) continue;
+        if (!free(bx)) continue;
+        boxes.push(bx);
+        out.push('<text class="vm-label' + (q.top ? " is-top" : "") + '" x="' + f1(lx) + '" y="' + f1(ly) + '" text-anchor="' + t[2] + '">' + escapeHtml(q.name) + "</text>");
+        break;
+      }
+    });
+    var title = opts.title || "Value map: score against monthly cost";
+    var desc = pts.length + " models plotted. The frontier, from cheapest up: " +
+      fp.map(function (q) { return q.name + " (score " + q.score + ", " + fmtMoney(q.cost) + ")"; }).join("; ") + ".";
+    var svg = '<svg class="vm-svg" viewBox="0 0 ' + W + " " + H + '" role="img" aria-labelledby="vm-title vm-desc">' +
+      '<title id="vm-title">' + escapeHtml(title) + '</title><desc id="vm-desc">' + escapeHtml(desc) + "</desc>" + out.join("") + "</svg>";
+    return { svg: svg, plotted: pts.length, skipped: (points || []).length - pts.length, frontier: front };
+  }
+
+  // ---------- head to head ----------
+  /** Rows for comparing a few ranked results side by side. best lists the column indexes with the best figure. */
+  function headToHead(results, p) {
+    var cols = results || [];
+    function numRow(label, better, get, fmt) {
+      var vals = cols.map(get), cells = vals.map(function (v) { return v === null || v === undefined || (typeof v === "number" && !isFinite(v)) ? "unknown" : fmt(v); });
+      var known = vals.filter(isNum), best = [];
+      if (known.length > 1 && Math.max.apply(null, known) !== Math.min.apply(null, known)) {
+        var target = better === "low" ? Math.min.apply(null, known) : Math.max.apply(null, known);
+        vals.forEach(function (v, i) { if (v === target) best.push(i); });
+      }
+      return { label: label, cells: cells, best: best };
+    }
+    function textRow(label, get) { return { label: label, cells: cols.map(get), best: [] }; }
+    var rows = [
+      numRow("Score", "high", function (r) { return r.total; }, String),
+      numRow("Monthly cost", "low", function (r) { return monthlyCost(r.model, p.inputTokens, p.outputTokens, p); }, fmtMoney)
+    ];
+    ["cost", "quality", "latency", "context", "privacy"].forEach(function (k) {
+      rows.push(numRow(COMPONENT_LABELS[k].charAt(0).toUpperCase() + COMPONENT_LABELS[k].slice(1) + " score", "high", function (r) { return Math.round(r.components[k] * 100); }, String));
+    });
+    rows.push(numRow("Input price per 1M", "low", function (r) { return r.model.input_price_per_mtok; }, fmtPrice));
+    rows.push(numRow("Output price per 1M", "low", function (r) { return r.model.output_price_per_mtok; }, fmtPrice));
+    rows.push(numRow("Context window", "high", function (r) { return r.model.context_window; }, function (v) { return fmtTokens(v) + " tokens"; }));
+    rows.push(numRow("Longest answer", "high", function (r) { return r.model.max_output_tokens; }, function (v) { return fmtTokens(v) + " tokens"; }));
+    rows.push(numRow("Quality tier (editorial)", "high", function (r) { return r.model.quality_tier; }, function (v) { return v + " of 5"; }));
+    rows.push(textRow("Speed class (editorial)", function (r) { return r.model.latency_class || "not rated"; }));
+    CAPABILITIES.forEach(function (k) {
+      rows.push(textRow(CAPABILITY_LABELS[k].charAt(0).toUpperCase() + CAPABILITY_LABELS[k].slice(1), function (r) {
+        var c = r.model.capabilities;
+        return r.model.kind === "embedding" ? "not applicable" : !c ? "no data" : c[k] ? "yes" : "no";
+      }));
+    });
+    rows.push(textRow("Open weights", function (r) { return r.model.open_weights ? "yes" : "no"; }));
+    return { columns: cols.map(function (r) { return r.model.model; }), rows: rows };
+  }
+
+  // ---------- decision memo ----------
+  var MODALITY_LABELS = { text: "text only", image: "images", file: "files (PDF and similar)", audio: "audio", video: "video" };
+  var QUALITY_LABELS = { basic: "basic", good: "good (most production work)", frontier: "frontier (hardest work)" };
+  var LATENCY_LABELS = { balanced: "balanced", fast: "fast (real time)", any: "does not matter (batch jobs)" };
+
+  function mdCell(s) { return String(s == null ? "" : s).replace(/\|/g, "/").replace(/\s+/g, " ").trim(); }
+  function fmtVolume(t) { var m = t / 1e6; return (m >= 100 ? Math.round(m) : round(m, 2)) + " million"; }
+
+  /** The profile in plain words, one item per requirement. */
+  function requirementLines(p) {
+    var needs = CAPABILITIES.filter(function (k) { return p.needs && p.needs[k]; }).map(function (k) { return CAPABILITY_LABELS[k]; });
+    return [
+      "Task: " + (TASK_LABELS[p.taskType] || p.taskType),
+      "Input: " + (MODALITY_LABELS[p.modality] || p.modality),
+      "Quality bar: " + (QUALITY_LABELS[p.quality] || p.quality),
+      "Speed target: " + (LATENCY_LABELS[p.latency] || p.latency),
+      "Longest input: " + fmtTokens(p.contextNeed) + " tokens",
+      "Budget: " + (isNum(p.budget) ? "$" + p.budget + " per million tokens, blended" : "no limit"),
+      "Privacy: " + (p.localOnly ? "local only, open weights on our own hardware" : "hosted providers allowed"),
+      "Must support: " + (needs.length ? needs.join(", ") : "nothing beyond text generation"),
+      "Volume: " + fmtVolume(p.inputTokens) + " input and " + fmtVolume(p.outputTokens) + " output tokens a month" +
+        (p.cacheShare > 0 ? ", " + Math.round(p.cacheShare * 100) + "% of input from the prompt cache" : "") + (p.useBatch ? ", batch prices where offered" : "")
+    ];
+  }
+
+  /**
+   * A Markdown memo for the decision: requirements, the pick and why, confidence, a cheaper option, runners-up,
+   * exclusions, caveats, and when to revisit. ctx: { res, p, description, rb, alt, now, catalogDate, liveAt, link }.
+   */
+  function decisionMemo(ctx) {
+    var res = ctx.res, p = ctx.p, top = res.ranked[0], L = [];
+    var day = (ctx.now instanceof Date ? ctx.now : new Date()).toISOString().slice(0, 10);
+    var task = String(ctx.description || "").trim();
+    L.push("# Model choice: " + (task ? mdCell(task) : (TASK_LABELS[p.taskType] || p.taskType)));
+    L.push("");
+    L.push("Prepared " + day + " with Model Scout. Data: catalog snapshot " + (ctx.catalogDate || "unknown") +
+      (ctx.liveAt ? ", with live OpenRouter prices fetched " + ctx.liveAt : ", bundled prices only (live data was not loaded)") + ".");
+    L.push("");
+    L.push("## Requirements");
+    requirementLines(p).forEach(function (x) { L.push("- " + x); });
+    L.push("");
+    if (!top) {
+      L.push("## Recommendation");
+      L.push("No model meets every hard constraint. Loosen one (local only, input type, or a required capability) and run it again.");
+    } else {
+      var mc = monthlyCost(top.model, p.inputTokens, p.outputTokens, p);
+      L.push("## Recommendation: " + mdCell(top.model.model) + " (" + mdCell(top.model.provider) + ")");
+      L.push("- Score " + top.total + " of 100" + (p.localOnly ? ", self-hosted (hosted reference " + fmtMoney(mc) + " a month)." : ", about " + fmtMoney(mc) + " a month at this volume."));
+      L.push("- Why: " + top.explain.why);
+      L.push("- Trade-offs: " + top.explain.tradeoffs);
+      if (ctx.rb) {
+        L.push("- Confidence: " + (ctx.rb.verdict === "tie" ? "tied on every factor with " + ctx.rb.runnerUp.model.model + "; either works." :
+          { stable: "stable", likely: "likely", close: "close call" }[ctx.rb.verdict] + ", first in " + Math.round(ctx.rb.topShare * 100) + "% of " + ctx.rb.samples + " reruns with each weight between half and double."));
+      }
+      if (ctx.alt) L.push("- Cheaper option within " + SWITCH_MARGIN + " points: " + ctx.alt.model.model + " scores " + ctx.alt.total + " for " + fmtMoney(ctx.alt.cost) + " a month, saving " + fmtMoney(ctx.alt.saves) + ".");
+      var flags = dataFlags(top.model, ctx.now).map(function (f) { return f.text; }).concat(top.flags);
+      flags.forEach(function (f) { L.push("- Check: " + f); });
+      L.push("");
+      L.push("## Shortlist");
+      L.push("| Rank | Model | Score | Monthly cost | Price in / out per 1M | Context |");
+      L.push("| --- | --- | --- | --- | --- | --- |");
+      res.ranked.slice(0, 5).forEach(function (r) {
+        L.push("| " + r.rank + " | " + mdCell(r.model.model + " (" + r.model.provider + ")") + " | " + r.total + " | " +
+          fmtMoney(monthlyCost(r.model, p.inputTokens, p.outputTokens, p)) + " | " + fmtPrice(r.model.input_price_per_mtok) + " / " + fmtPrice(r.model.output_price_per_mtok) + " | " + fmtTokens(r.model.context_window) + " |");
+      });
+    }
+    L.push("");
+    L.push("## Ruled out");
+    if (!res.excluded.length) L.push("- Nothing: every model passed the hard constraints.");
+    else {
+      res.excluded.slice(0, 6).forEach(function (r) { L.push("- " + mdCell(r.model.model) + ": " + r.excludeReason); });
+      if (res.excluded.length > 6) L.push("- And " + (res.excluded.length - 6) + " more.");
+    }
+    L.push("");
+    L.push("## Caveats");
+    L.push("- Quality tiers and speed classes are editorial, from each provider's own positioning. They are not benchmark scores.");
+    L.push("- Prices are OpenRouter's listed figures. Buying direct can differ. Cache write fees are not included.");
+    L.push("- Run the shortlist on 50 or more of your own examples before you commit.");
+    L.push("");
+    L.push("## Revisit when");
+    L.push("- A challenger beats this pick by " + SWITCH_MARGIN + " points or more on the same profile.");
+    L.push("- Prices change, the spec is older than " + STALE_AFTER_DAYS + " days, or the provider announces a retirement date.");
+    L.push("- Inputs get longer, a new input type or capability is needed, or volume grows tenfold.");
+    if (ctx.link) { L.push(""); L.push("Settings: " + ctx.link); }
+    return L.join("\n") + "\n";
+  }
+
   // ---------- live data (OpenRouter) ----------
   function perMillion(x) { var v = parseFloat(x); return isFinite(v) ? round(v * 1e6, 4) : null; }
 
@@ -954,6 +1182,7 @@
     effectivePrices: effectivePrices, volumeFromRequests: volumeFromRequests, retirement: retirement, liveFacts: liveFacts, perMillion: perMillion,
     robustness: robustness, presetSettings: presetSettings, profileFromSettings: profileFromSettings,
     encodeSettings: encodeSettings, decodeSettings: decodeSettings,
+    frontier: frontier, cheaperAlternative: cheaperAlternative, valueMapSvg: valueMapSvg, headToHead: headToHead, decisionMemo: decisionMemo,
     OPENROUTER_CHAT_URL: OPENROUTER_CHAT_URL, OLLAMA_CHAT_URL: OLLAMA_CHAT_URL, LOCAL_MODEL: LOCAL_MODEL,
     DEFAULT_CHAT_MODEL: DEFAULT_CHAT_MODEL, FEATURED_CHAT_MODELS: FEATURED_CHAT_MODELS, KEY_STORAGE: KEY_STORAGE,
     buildChatRequest: buildChatRequest, chatText: chatText, httpErrorText: httpErrorText, localModeCheck: localModeCheck,
@@ -968,7 +1197,8 @@
   // =====================================================================
   var CARD_LIMIT = 6;
   var state = { catalog: null, catalogOrigin: "", base: [], liveOnly: [], live: null, liveIds: null, now: new Date(), lastOrder: null,
-    touched: false, showAllCards: false, linkNote: "" };
+    touched: false, showAllCards: false, linkNote: "", compare: [], lastRes: null, lastProfile: null };
+  var COMPARE_MAX = 3;
 
   function $(id) { return document.getElementById(id); }
   function esc(s) {
@@ -1146,6 +1376,8 @@
     var p = readProfile();
     var res = rankModels(candidates(), p, state.now);
     renderWeights(res.weights);
+    state.lastRes = res;
+    state.lastProfile = p;
     var top = res.ranked[0];
 
     // The reveal animation plays only when the ranking order changes, not on every keystroke.
@@ -1172,6 +1404,7 @@
         "</div>" +
         '<p class="reason"><strong>Why:</strong> ' + esc(top.explain.why) + "</p>" +
         '<p class="reason"><strong>What you trade away:</strong> ' + esc(top.explain.tradeoffs) + "</p>" +
+        altHtml(cheaperAlternative(res.ranked, p)) +
         confidenceHtml(robustness(res), top) +
         flagList(tf.map(function (f) { return '<li class="' + f.level + '">' + esc(f.text) + "</li>"; })) +
         flagList(top.flags.map(function (f) { return '<li class="warn">' + esc(f) + "</li>"; }));
@@ -1235,9 +1468,184 @@
       return "<li><strong>" + esc(r.model.model) + "</strong> (" + esc(r.model.provider) + "): " + esc(r.excludeReason) + "</li>";
     }).join("") : "<li>None. Every model passed the hard constraints.</li>";
 
+    renderValueMap(res, p);
+    renderCompare(res, p);
     renderSwitchOptions();
     renderSwitch();
     syncUrl();
+  }
+
+  /** "Cheaper option within 5 points" under the top pick. */
+  function altHtml(alt) {
+    if (!alt) return "";
+    return '<p class="alt-pick"><span class="figure-label">Cheaper option within ' + SWITCH_MARGIN + ' points</span>' +
+      '<a href="#card-' + esc(alt.model.id) + '">' + esc(alt.model.model) + "</a> scores " + alt.total + " (rank #" + alt.rank + ") for " +
+      esc(fmtMoney(alt.cost)) + " a month: " + esc(fmtMoney(alt.saves)) + " less than the top pick, " + alt.gap + " points behind.</p>";
+  }
+
+  // ----- value map -----
+  function mapPoints(res, p) {
+    return res.ranked.map(function (r) {
+      return { id: r.model.id, name: r.model.model, rank: r.rank, cost: monthlyCost(r.model, p.inputTokens, p.outputTokens, p), score: r.total, top: r.rank === 1 };
+    });
+  }
+
+  function renderValueMap(res, p) {
+    var box = $("value-map"), out = $("value-map-readout"), pts = mapPoints(res, p);
+    var priced = pts.filter(function (q) { return isNum(q.cost) && q.cost > 0; });
+    if (!priced.length) {
+      box.innerHTML = '<p class="muted vm-empty">' + (res.ranked.length ? "Set a monthly volume above zero to place the models on the cost axis." : "No model to plot: every candidate failed a hard constraint.") + "</p>";
+      out.textContent = "";
+      state.mapFront = [];
+      return;
+    }
+    var vm = valueMapSvg(pts, { xLabel: p.localOnly ? "Hosted reference cost per month (log scale)" : null, width: box.clientWidth });
+    state.mapWidth = box.clientWidth;
+    box.innerHTML = vm.svg;
+    state.mapFront = vm.frontier;
+    state.mapNote = vm.frontier.length + " of " + vm.plotted + " models sit on the frontier" + (vm.skipped ? ". " + vm.skipped + " with unknown prices are not shown" : "") + ".";
+    out.textContent = state.mapNote;
+  }
+
+  function mapReadout(id) {
+    var res = state.lastRes, out = $("value-map-readout");
+    if (!res) return;
+    if (!id) { out.textContent = state.mapNote || ""; return; }
+    var r = res.ranked.filter(function (x) { return x.model.id === id; })[0];
+    if (!r) return;
+    var p = state.lastProfile, mc = monthlyCost(r.model, p.inputTokens, p.outputTokens, p);
+    out.textContent = "#" + r.rank + " " + r.model.model + " (" + r.model.provider + "): score " + r.total + ", " + fmtMoney(mc) + " a month." +
+      ((state.mapFront || []).indexOf(id) >= 0 ? " On the frontier." : "");
+  }
+
+  /** Scroll to a model card, opening the folded cards first if needed. */
+  function openCard(id) {
+    var card = document.getElementById("card-" + id);
+    if (!card) return;
+    if (card.hidden) { state.showAllCards = true; applyCardLimit(); }
+    if (card.scrollIntoView) card.scrollIntoView({ block: "start" });
+    if (typeof card.focus === "function") { card.setAttribute("tabindex", "-1"); card.focus({ preventScroll: true }); }
+  }
+
+  // ----- compare tray and head to head -----
+  function toggleCompare(id) {
+    var i = state.compare.indexOf(id), note = "";
+    if (i >= 0) state.compare.splice(i, 1);
+    else {
+      if (state.compare.length >= COMPARE_MAX) {
+        var dropped = state.compare.shift(), r = state.lastRes && state.lastRes.ranked.filter(function (x) { return x.model.id === dropped; })[0];
+        note = " Compare holds " + COMPARE_MAX + " models, so " + (r ? r.model.model : "the oldest pick") + " was taken out.";
+      }
+      state.compare.push(id);
+    }
+    state.compareNote = note;
+    renderCompare(state.lastRes, state.lastProfile);
+  }
+
+  function renderCompare(res, p) {
+    if (!res) return;
+    var byId = {};
+    res.ranked.forEach(function (r) { byId[r.model.id] = r; });
+    var picked = state.compare.map(function (id) { return byId[id]; }).filter(Boolean);
+    var gone = state.compare.filter(function (id) { return !byId[id]; });
+    Array.prototype.forEach.call(document.querySelectorAll(".compare-btn"), function (b) {
+      var on = state.compare.indexOf(b.getAttribute("data-compare")) >= 0;
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+      b.firstChild.nodeValue = on ? "In comparison" : "Compare";
+    });
+    // tray
+    var tray = $("compare-tray");
+    tray.hidden = !state.compare.length;
+    document.body.classList.toggle("has-tray", !!state.compare.length);
+    var names = picked.map(function (r) { return r.model.model; });
+    $("compare-tray-text").textContent = !state.compare.length ? "" :
+      (picked.length < 2 ? "Comparing " + (names[0] || "nothing ranked") + ". Pick one or two more with Compare on the cards." :
+        "Comparing " + picked.length + ": " + names.join(", ") + ".") +
+      (gone.length ? " " + gone.length + " picked model" + (gone.length > 1 ? "s are" : " is") + " excluded by the current profile." : "") + (state.compareNote || "");
+    $("compare-tray-go").hidden = picked.length < 2;
+    // head to head
+    var sec = $("h2h");
+    sec.hidden = picked.length < 2;
+    if (picked.length < 2) return;
+    var h = headToHead(picked, p);
+    var head = '<thead><tr><th scope="col"><span class="visually-hidden">Figure</span></th>' + picked.map(function (r) {
+      return '<th scope="col"><span class="h2h-rank">#' + r.rank + "</span> " + esc(r.model.model) + "<small>" + esc(r.model.provider) + "</small>" +
+        '<button type="button" class="h2h-remove" data-compare="' + esc(r.model.id) + '">Remove<span class="visually-hidden"> ' + esc(r.model.model) + "</span></button></th>";
+    }).join("") + "</tr></thead>";
+    var body = "<tbody>" + h.rows.map(function (row) {
+      return '<tr><th scope="row">' + esc(row.label) + "</th>" + row.cells.map(function (c, i) {
+        var best = row.best.indexOf(i) >= 0;
+        return "<td" + (best ? ' class="is-best"' : "") + ">" + esc(c) + (best ? ' <span class="h2h-best">best</span>' : "") + "</td>";
+      }).join("") + "</tr>";
+    }).join("") + "</tbody>";
+    $("h2h-table").innerHTML = head + body;
+    var askable = picked.filter(function (r) { return r.model.openrouter_id && r.model.kind !== "embedding"; });
+    $("h2h-ask").disabled = askable.length < 2;
+    $("h2h-ask").textContent = askable.length < 2 ? "Side by side needs two models listed on OpenRouter" : "Ask " + askable[0].model.model + " and " + askable[1].model.model + " side by side";
+    $("h2h-lede").textContent = "The " + picked.length + " models you picked with Compare, under your current profile. The better figure in each row is marked; prices are list prices per million tokens.";
+  }
+
+  function askPairSideBySide() {
+    var res = state.lastRes, byId = {};
+    if (!res) return;
+    res.ranked.forEach(function (r) { byId[r.model.id] = r; });
+    var pair = state.compare.map(function (id) { return byId[id]; }).filter(function (r) { return r && r.model.openrouter_id && r.model.kind !== "embedding"; }).slice(0, 2);
+    if (pair.length < 2) return;
+    pair.forEach(function (r) {
+      var listed = Array.prototype.some.call($("side-model-a").options, function (o) { return o.value === r.model.openrouter_id; });
+      if (!listed) chat.extra.push({ openrouter_id: r.model.openrouter_id, model: r.model.model });
+    });
+    fillChatPickers();
+    var note = "";
+    if (chatProvider() === "local") {
+      $("chat-provider-openrouter").checked = true;
+      applyProvider();
+      note = " Switched the provider to OpenRouter, because local mode only runs dolphin3.";
+    }
+    $("chat-mode-side").checked = true;
+    applyMode();
+    $("side-model-a").value = pair[0].model.openrouter_id;
+    $("side-model-b").value = pair[1].model.openrouter_id;
+    chat.side = [null, null];
+    renderSideIdle();
+    chatNote("Left: " + pair[0].model.model + ". Right: " + pair[1].model.model + "." + note + " Type one question for both.", "ok");
+    var panel = $("chat-main");
+    if (panel.scrollIntoView) panel.scrollIntoView({ block: "start" });
+    $("side-input").focus();
+  }
+
+  // ----- decision memo -----
+  function memoText() {
+    var p = readProfile(), res = rankModels(candidates(), p, state.now);
+    return decisionMemo({
+      res: res, p: p, description: $("task-desc").value, rb: robustness(res), alt: cheaperAlternative(res.ranked, p),
+      now: new Date(), catalogDate: state.catalog && state.catalog.catalog_date,
+      liveAt: state.live && state.live.ok ? state.live.fetchedAt.toLocaleString() : null, link: shareUrl()
+    });
+  }
+
+  function copyMemo() {
+    var text = memoText(), out = $("share-status");
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard.writeText(text).then(function () {
+        out.textContent = "Decision memo copied as Markdown. It includes your description, so check it before you share it.";
+      }, function () { out.textContent = "This browser blocked the clipboard. Use Download memo instead."; });
+    } else out.textContent = "This browser blocked the clipboard. Use Download memo instead.";
+  }
+
+  function downloadMemo() {
+    var text = memoText(), out = $("share-status");
+    try {
+      var url = URL.createObjectURL(new Blob([text], { type: "text/markdown" }));
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "model-choice-" + new Date().toISOString().slice(0, 10) + ".md";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      out.textContent = "Memo saved as " + a.download + ". It includes your description, so check it before you share it.";
+    } catch (e) { out.textContent = "This browser could not save the file. Use Copy decision memo instead."; }
   }
 
   /** Only the first CARD_LIMIT cards show until the reader asks for all of them. */
@@ -1440,14 +1848,17 @@
 
   /** The button at the foot of every model card. Models that cannot chat get a disabled button and the reason. */
   function askButton(m) {
+    var on = state.compare.indexOf(m.id) >= 0;
+    var cmp = '<button type="button" class="btn compare-btn" data-compare="' + esc(m.id) + '" aria-pressed="' + on + '">' +
+      (on ? "In comparison" : "Compare") + '<span class="visually-hidden">: ' + esc(m.model) + "</span></button>";
     if (m.kind === "embedding" || !m.openrouter_id) {
       var nid = "ask-note-" + m.id;
-      return '<div class="card-actions"><button type="button" class="btn ask-btn" disabled aria-describedby="' + esc(nid) + '">Ask this model</button>' +
+      return '<div class="card-actions"><div class="row">' + cmp + '<button type="button" class="btn ask-btn" disabled aria-describedby="' + esc(nid) + '">Ask this model</button></div>' +
         '<small id="' + esc(nid) + '">' + (m.kind === "embedding" ? "Embedding models make search vectors and cannot chat." :
           "Not listed on OpenRouter, so it cannot be asked from here.") + "</small></div>";
     }
-    return '<div class="card-actions"><button type="button" class="btn ask-btn" data-ask="' + esc(m.openrouter_id) + '" data-name="' + esc(m.model) + '">' +
-      'Ask this model<span class="visually-hidden">: ' + esc(m.model) + "</span></button></div>";
+    return '<div class="card-actions"><div class="row">' + cmp + '<button type="button" class="btn ask-btn" data-ask="' + esc(m.openrouter_id) + '" data-name="' + esc(m.model) + '">' +
+      'Ask this model<span class="visually-hidden">: ' + esc(m.model) + "</span></button></div></div>";
   }
 
   /** Every model the chat can name: featured, catalog (with live prices once loaded), live-only, and models added from cards. */
@@ -1757,6 +2168,8 @@
     $("cards").addEventListener("click", function (e) {
       var b = e.target && e.target.closest ? e.target.closest(".ask-btn") : null;
       if (b && !b.disabled) askFromCard(b);
+      var c = e.target && e.target.closest ? e.target.closest(".compare-btn") : null;
+      if (c) toggleCompare(c.getAttribute("data-compare"));
     });
     fillChatPickers();
     applyProvider();
@@ -1799,13 +2212,35 @@
       applyCardLimit();
       if (!state.showAllCards) $("cards-toggle").scrollIntoView({ block: "nearest" });
     });
-    // A table link to a card that is folded away opens every card first, so the jump lands.
-    $("compare-body").addEventListener("click", function (e) {
+    // A link to a card that is folded away opens every card first, so the jump lands.
+    document.addEventListener("click", function (e) {
       var a = e.target && e.target.closest ? e.target.closest('a[href^="#card-"]') : null;
       if (!a) return;
       var card = document.getElementById(a.getAttribute("href").slice(1));
       if (card && card.hidden) { state.showAllCards = true; applyCardLimit(); }
     });
+    var map = $("value-map");
+    function dot(e) { return e.target && e.target.closest ? e.target.closest("circle[data-id]") : null; }
+    map.addEventListener("mouseover", function (e) { var d = dot(e); if (d) mapReadout(d.getAttribute("data-id")); });
+    map.addEventListener("mouseleave", function () { mapReadout(null); });
+    map.addEventListener("click", function (e) { var d = dot(e); if (d) openCard(d.getAttribute("data-id")); });
+    $("h2h-table").addEventListener("click", function (e) {
+      var b = e.target && e.target.closest ? e.target.closest(".h2h-remove") : null;
+      if (b) toggleCompare(b.getAttribute("data-compare"));
+    });
+    $("h2h-ask").addEventListener("click", askPairSideBySide);
+    function clearCompare() { state.compare = []; state.compareNote = ""; renderCompare(state.lastRes, state.lastProfile); }
+    $("h2h-clear").addEventListener("click", clearCompare);
+    $("compare-tray-clear").addEventListener("click", clearCompare);
+    var resizeTimer = null;
+    window.addEventListener("resize", function () {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function () {
+        if (state.lastRes && Math.abs($("value-map").clientWidth - (state.mapWidth || 0)) > 30) renderValueMap(state.lastRes, state.lastProfile);
+      }, 150);
+    });
+    $("memo-copy").addEventListener("click", copyMemo);
+    $("memo-download").addEventListener("click", downloadMemo);
     renderPresets();
     renderHelper();
     settingsFromUrl();

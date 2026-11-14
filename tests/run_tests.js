@@ -578,6 +578,79 @@ test("description hints now cover tools, JSON, and batch work", function () {
   assert.strictEqual(s.tools, true); assert.strictEqual(s.json, true); assert.strictEqual(s.useBatch, true); assert.strictEqual(s.latency, "any");
 });
 
+section("Value map, cheaper option, head to head, decision memo");
+test("frontier keeps only points nothing beats on both score and cost", function () {
+  var pts = [{ id: "a", cost: 1, score: 50 }, { id: "b", cost: 2, score: 70 }, { id: "c", cost: 3, score: 60 },
+    { id: "d", cost: 5, score: 90 }, { id: "e", cost: 5, score: 80 }, { id: "f", cost: 8, score: 90 }, { id: "g", cost: null, score: 99 }];
+  assert.deepStrictEqual(S.frontier(pts), ["a", "b", "d"]);
+  assert.deepStrictEqual(S.frontier([]), []);
+});
+test("cheaper option: the cheapest model within 5 points that costs less", function () {
+  var top = mk({ id: "top", quality_tier: 5, input_price_per_mtok: 3, output_price_per_mtok: 12 });
+  var near = mk({ id: "near", quality_tier: 5, input_price_per_mtok: 2.5, output_price_per_mtok: 10 });
+  var res = S.rankModels([top, near], profile(), NOW);
+  var alt = S.cheaperAlternative(res.ranked, profile());
+  assert.strictEqual(res.ranked[0].model.id, "near", "cheaper model with the same tier should rank first");
+  assert.strictEqual(alt, null, "nothing cheaper than the top pick");
+  var p2 = profile({ quality: "frontier" });
+  var res2 = S.rankModels([mk({ id: "big", quality_tier: 5, input_price_per_mtok: 3, output_price_per_mtok: 12 }), mk({ id: "mid", quality_tier: 4, input_price_per_mtok: 0.5, output_price_per_mtok: 2 })], p2, NOW);
+  var gap = res2.ranked[0].total - res2.ranked[1].total;
+  var alt2 = S.cheaperAlternative(res2.ranked, p2, Math.ceil(gap) + 1);
+  assert.ok(alt2 && alt2.model.id === res2.ranked[1].model.id && alt2.saves > 0, JSON.stringify(alt2 && alt2.model.id));
+  assert.strictEqual(S.cheaperAlternative(res2.ranked, p2, gap / 2), null, "outside the gap");
+  assert.strictEqual(S.cheaperAlternative(res2.ranked, profile({ localOnly: true })), null);
+});
+test("cheaper option on the real catalog: bulk tagging preset finds one", function () {
+  var p = S.profileFromSettings(S.presetSettings("bulk"));
+  var res = S.rankModels(models, p, NOW), alt = S.cheaperAlternative(res.ranked, p);
+  assert.ok(alt && alt.cost < alt.topCost && res.ranked[0].total - alt.total <= S.SWITCH_MARGIN);
+});
+test("value map SVG: labelled, one dot per priced model, frontier line, escaped names", function () {
+  var pts = [{ id: "a", name: "A<b>", cost: 1, score: 50, top: false }, { id: "b", name: "B", cost: 10, score: 80, top: true },
+    { id: "c", name: "C", cost: 20, score: 60 }, { id: "d", name: "D", cost: null, score: 70 }];
+  var vm = S.valueMapSvg(pts);
+  assert.strictEqual(vm.plotted, 3); assert.strictEqual(vm.skipped, 1);
+  assert.strictEqual((vm.svg.match(/<circle /g) || []).length, 3);
+  assert.ok(/role="img"/.test(vm.svg) && /<title id="vm-title">/.test(vm.svg) && /<desc id="vm-desc">/.test(vm.svg));
+  assert.ok(/class="vm-front"/.test(vm.svg), "frontier path");
+  assert.ok(/A&lt;b&gt;/.test(vm.svg) && !/A<b>/.test(vm.svg), "names escaped");
+  assert.ok(/class="vm-pt is-front is-top"/.test(vm.svg), "top pick marked");
+  assert.ok(/viewBox="0 0 400 320"/.test(S.valueMapSvg(pts, { width: 400 }).svg), "drawn at the container width");
+  assert.strictEqual(S.valueMapSvg([]).svg, "");
+});
+test("head to head marks the better figure, and no winner when all are equal", function () {
+  var a = mk({ id: "a", model: "A", input_price_per_mtok: 1, capabilities: { tools: true, json: true, reasoning: false } });
+  var b = mk({ id: "b", model: "B", input_price_per_mtok: 2, capabilities: null });
+  var res = S.rankModels([a, b], profile(), NOW), h = S.headToHead(res.ranked, profile());
+  function row(l) { return h.rows.filter(function (r) { return r.label === l; })[0]; }
+  assert.deepStrictEqual(h.columns, ["A", "B"]);
+  assert.deepStrictEqual(row("Score").best, [0]);
+  assert.deepStrictEqual(row("Monthly cost").best, [0]);
+  assert.deepStrictEqual(row("Input price per 1M").best, [0]);
+  assert.deepStrictEqual(row("Quality score").best, [], "equal values have no winner");
+  assert.deepStrictEqual(row("Tool calling").cells, ["yes", "no data"]);
+  assert.deepStrictEqual(row("Reasoning mode").cells, ["no", "no data"]);
+});
+test("decision memo: requirements, pick, shortlist, exclusions, caveats, and no em dashes", function () {
+  var p = S.profileFromSettings(S.presetSettings("bulk"));
+  var res = S.rankModels(models, p, NOW);
+  var md = S.decisionMemo({ res: res, p: p, description: "Tag | reviews", rb: S.robustness(res), alt: S.cheaperAlternative(res.ranked, p),
+    now: NOW, catalogDate: catalog.catalog_date, liveAt: null, link: "https://example.com/model-scout/?quality=basic" });
+  ["# Model choice: Tag / reviews", "## Requirements", "## Recommendation: " + res.ranked[0].model.model, "## Shortlist", "## Ruled out", "## Caveats", "## Revisit when",
+   "- Must support: JSON output", "batch prices where offered", "Cheaper option within 5 points", "Settings: https://example.com/model-scout/?quality=basic"].forEach(function (needle) {
+    assert.ok(md.indexOf(needle) >= 0, "memo is missing: " + needle);
+  });
+  assert.strictEqual((md.match(/^\| \d+ \|/gm) || []).length, Math.min(5, res.ranked.length));
+  assert.ok(md.indexOf("—") < 0, "em dash in memo");
+  assert.ok(/bundled prices only/.test(md));
+});
+test("decision memo with nothing ranked says so instead of naming a pick", function () {
+  var p = profile({ localOnly: true });
+  var res = S.rankModels([mk({ open_weights: false })], p, NOW);
+  var md = S.decisionMemo({ res: res, p: p, now: NOW, catalogDate: "2026-11-13" });
+  assert.ok(/No model meets every hard constraint/.test(md) && !/## Shortlist/.test(md));
+});
+
 section("Catalog refresh tool");
 var refreshTool = require("../tools/refresh_catalog.js");
 test("refresh updates listed figures and leaves editorial fields alone", function () {
