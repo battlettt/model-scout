@@ -989,6 +989,73 @@ test("every catalog model listed on OpenRouter has hosts data from a dated snaps
   });
 });
 
+section("Hosts right now (live check, pure)");
+var liveEp = { data: { id: "acme/a", endpoints: [
+  { provider_name: "Beta", tag: "beta/fp8", quantization: "fp8", uptime_last_5m: 100, uptime_last_30m: 100, uptime_last_1d: 99.5,
+    pricing: { prompt: "0.0000002", completion: "0.0000008" }, max_completion_tokens: 8192, status: 0 },
+  { provider_name: "Alpha", tag: "alpha", quantization: "unknown", uptime_last_5m: 0, uptime_last_30m: 40, uptime_last_1d: 90,
+    pricing: { prompt: "0.0000001", completion: "0.0000004" }, max_completion_tokens: null, status: -2 },
+  { provider_name: "Alpha", tag: "alpha/eu", quantization: "BF16", uptime_last_5m: 100, uptime_last_30m: 100, uptime_last_1d: 100,
+    pricing: { prompt: "0.0000003", completion: "0.000001" }, max_completion_tokens: 16384 },
+  { provider_name: "Delta", tag: "delta", quantization: "fp16", uptime_last_5m: null, uptime_last_30m: null, uptime_last_1d: null, pricing: { prompt: "-1", completion: "0.000001" } },
+  { provider_name: "", tag: "x" }, null, "junk", { provider_name: "Gamma", uptime_last_30m: 120, pricing: {} }
+] } };
+test("liveHostRows reads each endpoint and puts the best 30-minute uptime first, then the cheapest", function () {
+  var rows = S.liveHostRows(liveEp);
+  assert.deepStrictEqual(rows.map(S.endpointLabel), ["Beta", "Alpha (eu)", "Alpha", "Delta", "Gamma"]);
+  assert.deepStrictEqual(rows[0], { provider: "Beta", variant: "fp8", quantization: "fp8", up5: 100, up30: 100, up1d: 99.5, input: 0.2, output: 0.8, maxOutput: 8192 });
+  assert.deepStrictEqual([rows[1].quantization, rows[2].quantization, rows[2].maxOutput], ["bf16", null, null]);
+  assert.deepStrictEqual([rows[3].input, rows[3].output], [null, 1], "a negative price is not a price");
+  assert.deepStrictEqual([rows[4].up30, rows[4].input, rows[4].output], [null, null, null], "uptime over 100 and missing prices are unknown");
+  assert.ok(!("status" in rows[0]), "status codes are left out: their meaning is not documented");
+  assert.strictEqual(S.liveHostRows({ data: {} }), null);
+  assert.strictEqual(S.liveHostRows(null), null);
+  assert.deepStrictEqual(S.liveHostRows({ data: { endpoints: [] } }), []);
+  assert.strictEqual(S.endpointsUrl("openai/gpt-oss-120b:free"), "https://openrouter.ai/api/v1/models/openai/gpt-oss-120b%3Afree/endpoints");
+});
+test("the check says who serves it now, what changed since the snapshot, uptime, and the cheapest steady endpoint", function () {
+  var m = mk({ hosts: { endpoints: 3, providers: ["Alpha", "Beta", "Omega"], quantizations: [] } });
+  var c = S.hostCheck(S.liveHostRows(liveEp), m, profile());
+  assert.deepStrictEqual([c.endpoints, c.providers, c.steady, c.quiet, c.added, c.removed, c.backup], [5, ["Alpha", "Beta", "Delta", "Gamma"], 2, 2, ["Delta", "Gamma"], ["Omega"], null]);
+  assert.deepStrictEqual(S.hostCheckText(c, m, "2026-11-14"), [
+    "4 providers serve it on OpenRouter right now, 5 endpoints.",
+    "New since the 2026-11-14 snapshot: Delta and Gamma.",
+    "Gone since the 2026-11-14 snapshot: Omega.",
+    "2 of 3 measured endpoints were up at least 99% of the last 30 minutes; 2 had too little traffic to measure.",
+    "Cheapest endpoint up at least 99% of the last 30 minutes: Beta at $0.20 / $0.80, serving fp8."
+  ]);
+  var priced = { data: { endpoints: liveEp.data.endpoints.slice(0, 3) } };
+  var t = S.hostCheckText(S.hostCheck(S.liveHostRows(priced), mk({}), profile()), mk({ input_price_per_mtok: 0.1, output_price_per_mtok: 0.4 }), "");
+  assert.strictEqual(t[2], "Prices per 1M range from $0.10 to $0.30 in and $0.40 to $1.00 out across endpoints; the ranking uses $0.10 / $0.40.", t.join(" | "));
+  assert.strictEqual(t[3], "Cheapest endpoint up at least 99% of the last 30 minutes: Beta at $0.20 / $0.80, serving fp8.");
+});
+test("one provider, one price: the check says so and answers the backup host question for the profile", function () {
+  function ep(tag) { return { provider_name: "Solo", tag: tag, quantization: "unknown", uptime_last_5m: 100, uptime_last_30m: 100, uptime_last_1d: 100, pricing: { prompt: "0.000001", completion: "0.000004" } }; }
+  var rows = S.liveHostRows({ data: { endpoints: [ep("solo"), ep("solo/eu")] } });
+  assert.deepStrictEqual(S.hostCheckText(S.hostCheck(rows, mk({}), profile({ backupHost: true })), mk({}), "2026-11-14"), [
+    "One provider serves it on OpenRouter right now (Solo, 2 endpoints).",
+    "2 of 2 measured endpoints were up at least 99% of the last 30 minutes.",
+    "Every endpoint charges the same: $1.00 / $4.00 per 1M in / out.",
+    "Your profile needs a backup host: not met right now, only one provider is listed."
+  ]);
+  assert.strictEqual(S.hostCheck(rows, mk({}), profile({ backupHost: true, localOnly: true })).backup, null, "local only has no host to back up");
+  var none = S.hostCheckText(S.hostCheck([], mk({}), profile({ backupHost: true })), mk({}), "");
+  assert.deepStrictEqual(none, ["OpenRouter lists no endpoints for this model right now, so requests to it would fail.", "Your profile needs a backup host: not met right now, no provider is listed."]);
+});
+test("with zero data retention on, the live backup check counts only providers on the zero-data-retention list", function () {
+  var rows = S.liveHostRows(liveEp), p = profile({ backupHost: true, zdr: true });
+  function zm(list) { return mk({ zdr: { endpoints: list.length, providers: list, cheapest: list[0], input_price_per_mtok: 1, output_price_per_mtok: 4, cache_read_price_per_mtok: null } }); }
+  function last(m) { var t = S.hostCheckText(S.hostCheck(rows, m, p), m, ""); return t[t.length - 1]; }
+  assert.strictEqual(last(zm(["Alpha", "Beta"])), "Your profile needs a backup host: met right now, 2 zero-data-retention providers.");
+  assert.strictEqual(last(zm(["Beta", "Omega"])), "Your profile needs a backup host: not met right now, only one zero-data-retention provider is listed.");
+  assert.strictEqual(last(mk({})), "Your profile needs a backup host: this cannot be checked, because the snapshot has no zero-data-retention data for this model.");
+  assert.deepStrictEqual(S.hostCheck(rows, zm(["Beta"]), p).zdrProviders, ["Beta"]);
+  var t = S.hostCheckText(S.hostCheck(rows, zm(["Alpha"]), p), zm(["Alpha"]), "");
+  assert.ok(t.indexOf("Cheapest zero-data-retention endpoint up at least 99% of the last 30 minutes: Alpha (eu) at $0.30 / $1.00.") >= 0,
+    "the cheaper non-ZDR endpoint (Beta) must not be offered: " + t.join(" | "));
+  assert.strictEqual(S.hostCheck(rows, zm(["Beta"]), profile()).zdrProviders, null, "no ZDR marks when ZDR is not required");
+});
+
 section("Split traffic with a cheaper model");
 test("route options are the ranked models cheaper than the top pick, in rank order", function () {
   var top = mk({ id: "top", quality_tier: 5 }), mid = mk({ id: "mid", quality_tier: 4, input_price_per_mtok: 0.5, output_price_per_mtok: 2 });
@@ -2085,6 +2152,48 @@ atest("the JavaScript request sends the body with the key from the environment a
     assert.strictEqual(sent.init.headers.Authorization, "Bearer local-test");
     assert.deepStrictEqual(JSON.parse(sent.init.body), S.snippetBody(models, p));
     assert.deepStrictEqual(logged, ["acme/b", "hi"]);
+  });
+});
+
+asection("Hosts right now: fetching (stubbed fetch, no network)");
+function hostResp(status, body, badJson) {
+  return { ok: status >= 200 && status < 300, status: status, json: function () { return badJson ? Promise.reject(new SyntaxError("bad")) : Promise.resolve(body); } };
+}
+atest("fetchHosts asks the public endpoint list with no key and returns sorted rows", function () {
+  var seen = null;
+  return S.fetchHosts(function (url, init) { seen = { url: url, init: init }; return Promise.resolve(hostResp(200, liveEp)); }, "acme/a").then(function (r) {
+    assert.strictEqual(seen.url, "https://openrouter.ai/api/v1/models/acme/a/endpoints");
+    assert.ok(!seen.init.headers && !seen.init.method, "a plain GET with no headers, so no key can travel");
+    assert.ok(r.ok && r.rows.length === 5 && r.rows[0].provider === "Beta" && r.error === "", JSON.stringify(r).slice(0, 200));
+  });
+});
+atest("fetchHosts never rejects: it names what went wrong", function () {
+  function run(fetchFn, id, opts) { return S.fetchHosts(fetchFn, id === undefined ? "acme/a" : id, opts).then(function (r) { assert.ok(!r.ok && r.rows === null); return r.error; }); }
+  function hang(url, init) {
+    return new Promise(function (_, reject) { init.signal.addEventListener("abort", function () { var e = new Error("aborted"); e.name = "AbortError"; reject(e); }); });
+  }
+  return Promise.all([
+    run(function () { return Promise.resolve(hostResp(404, null)); }),
+    run(function () { return Promise.resolve(hostResp(502, null)); }),
+    run(function () { return Promise.reject(new TypeError("Failed to fetch")); }),
+    run(function () { return Promise.resolve(hostResp(200, null, true)); }),
+    run(function () { return Promise.resolve(hostResp(200, { data: { id: "acme/a" } })); }),
+    run(function () { throw new Error("sync throw"); }),
+    run(null),
+    run(function () { return Promise.resolve(hostResp(200, liveEp)); }, ""),
+    run(hang, "acme/a", { timeoutMs: 20 })
+  ]).then(function (errs) {
+    assert.deepStrictEqual(errs, [
+      "OpenRouter has no endpoint list for this model right now. It may have been renamed or retired.",
+      "OpenRouter answered with HTTP 502.",
+      "Could not reach OpenRouter (offline, or blocked by the browser or network).",
+      "OpenRouter's answer was not valid JSON.",
+      "OpenRouter's answer did not contain an endpoint list.",
+      "Could not reach OpenRouter (offline, or blocked by the browser or network).",
+      "This browser cannot send requests (no fetch).",
+      "This model is not listed on OpenRouter.",
+      "OpenRouter did not answer within 1 second."
+    ]);
   });
 });
 

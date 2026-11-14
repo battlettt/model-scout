@@ -58,6 +58,9 @@ function boot(opts) {
       chats.push(c);
       return opts.chat ? opts.chat(c) : Promise.reject(new TypeError("Failed to fetch"));
     }
+    if (/^https:\/\/openrouter\.ai\/api\/v1\/models\/.+\/endpoints$/.test(String(url))) {
+      return opts.hosts ? opts.hosts(String(url), init) : Promise.reject(new TypeError("Failed to fetch"));
+    }
     return Promise.reject(new Error("unexpected fetch " + url));
   };
   w.eval(APP);
@@ -661,6 +664,60 @@ test("backup host: a link with backup=1 checks the box, leaves out one-host mode
     p.$("need-backup").checked = false; fire(p, "need-backup", "change");
     ok(!/backup=/.test(p.w.location.search), "address: " + p.w.location.search);
     ok(ranked() > before && !/without a backup host/.test(p.$("excluded-summary").textContent), "rows " + before + " -> " + ranked());
+  });
+});
+
+test("hosts right now: a card checks OpenRouter live, shows uptime and the backup verdict, keeps it across re-renders, and reports errors", function () {
+  var pending = [], hostCalls = [];
+  function ep(name, tag, up30, prompt) {
+    return { provider_name: name, tag: tag, quantization: "unknown", uptime_last_5m: up30, uptime_last_30m: up30, uptime_last_1d: 99,
+      pricing: { prompt: prompt, completion: "0.00001" }, max_completion_tokens: 32000 };
+  }
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3&backup=1",
+    hosts: function (url, init) {
+      hostCalls.push(url);
+      if (hostCalls.length > 1) return resp(null, 404);
+      return new Promise(function (r) { pending.push(function () { r({ ok: true, status: 200, json: function () {
+        return Promise.resolve({ data: { endpoints: [ep("Alpha", "alpha", 100, "0.000002"), ep("Beta", "beta/eu", 100, "0.000003"), ep("Beta", "beta", 42.5, "0.000001")] } }); } }); }); });
+    } });
+  var card, btn, box;
+  return settled(p).then(function () {
+    card = p.d.querySelector("#cards .card.is-top");
+    btn = card.querySelector(".hosts-btn");
+    box = card.querySelector(".live-hosts");
+    ok(btn && /^Check hosts now/.test(btn.textContent) && box && box.textContent === "", "button and empty block on the top card");
+    ok(btn.getAttribute("aria-controls") === box.id && box.getAttribute("aria-live") === "polite", "button controls a live region");
+    btn.click();
+    ok(btn.getAttribute("aria-disabled") === "true" && /^Checking hosts/.test(btn.textContent) && /Checking OpenRouter for the hosts/.test(box.textContent), "loading: " + box.textContent);
+    btn.click();
+    ok(hostCalls.length === 1, "a second click while loading should not send another request");
+    ok(hostCalls[0] === "https://openrouter.ai/api/v1/models/" + btn.getAttribute("data-hosts") + "/endpoints", "url: " + hostCalls[0]);
+    return waitFor(function () { return pending.length; }, "hosts request");
+  }).then(function () {
+    pending[0]();
+    return waitFor(function () { return /Hosts right now/.test(box.textContent); }, "check result");
+  }).then(function () {
+    var text = box.querySelector(".live-hosts-text").textContent;
+    ok(box.querySelectorAll(".live-hosts-text li").length >= 5 && /^2 providers/.test(box.querySelector(".live-hosts-text li").textContent), "one line per fact");
+    ok(/^2 providers serve it on OpenRouter right now, 3 endpoints\./.test(text) && /2 of 3 measured endpoints were up at least 99%/.test(text), "text: " + text);
+    ok(/Your profile needs a backup host: met right now, 2 providers\./.test(text), "backup verdict: " + text);
+    ok(/Cheapest endpoint up at least 99% of the last 30 minutes: Alpha at \$2\.00 \/ \$10\.00\./.test(text), "cheapest steady: " + text);
+    ok(/All 3 endpoints/.test(box.querySelector("summary").textContent) && box.querySelectorAll("tbody tr").length === 3, "table rows");
+    ok(box.querySelectorAll("td.is-low").length === 1 && /42\.5%/.test(box.querySelector("td.is-low").textContent), "low uptime marked");
+    ok(/Beta \(eu\)/.test(box.querySelector("tbody").textContent), "regional endpoint labelled");
+    ok(!btn.hasAttribute("aria-disabled") && /^Check hosts again/.test(btn.textContent), "button after: " + btn.textContent);
+    p.$("need-backup").checked = false; fire(p, "need-backup", "change");
+    card = p.d.querySelector("#cards .card.is-top");
+    var again = card.querySelector(".live-hosts-text");
+    ok(again && !/backup host/.test(again.textContent), "result kept after re-render, backup sentence gone: " + (again && again.textContent));
+    var other = p.d.querySelectorAll("#cards .card")[1].querySelector(".hosts-btn");
+    other.click();
+    var otherBox = p.$(other.getAttribute("aria-controls"));
+    return waitFor(function () { return /no endpoint list/.test(otherBox.textContent); }, "error note");
+  }).then(function () {
+    var other = p.d.querySelectorAll("#cards .card")[1].querySelector(".live-hosts");
+    ok(/It may have been renamed or retired\. The \d{4}-\d{2}-\d{2} snapshot on this card still applies\./.test(other.textContent), "error: " + other.textContent);
+    ok(other.querySelector(".is-warn"), "error is marked");
   });
 });
 

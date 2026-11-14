@@ -48,7 +48,7 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - Stale = `last_verified` missing, invalid, future, or older than 90 days (`STALE_AFTER_DAYS` in app.js, `stale_after_days` in catalog.json).
 - Prices are USD per million tokens; null only with `price_status: "unverified"`. Field-level doubts go in `unverified_fields`.
 - `quality_tier` and `latency_class` are editorial, from provider positioning. Never add benchmark numbers.
-- Live data: browser fetches https://openrouter.ai/api/v1/models (no key). On failure, fall back to the bundled catalog and say so.
+- Live data: browser fetches https://openrouter.ai/api/v1/models (no key). On failure, fall back to the bundled catalog and say so. "Check hosts now" on a card fetches that model's `/api/v1/models/{id}/endpoints` on demand (`fetchHosts`, `liveHostRows`, `hostCheck`, `hostCheckText`): uptime over 5 min, 30 min and 1 day, per-endpoint prices, providers added or gone since the snapshot, the backup verdict; shown, never stored; status codes skipped (their meaning is undocumented).
 - Capabilities come only from OpenRouter's `supported_parameters` (tools; response_format or structured_outputs; reasoning or include_reasoning). Batch prices come from the `:batch` variant and are used only when lower. Unknown stays null and is flagged, never guessed.
 - Refresh: `curl -s https://openrouter.ai/api/v1/models -o /tmp/or.json && node tools/refresh_catalog.js /tmp/or.json` (add `--dry-run` to preview; add `--zdr /tmp/zdr.json` from https://openrouter.ai/api/v1/endpoints/zdr to refresh ZDR data; add `--endpoints <dir>` of saved /api/v1/models/{id}/endpoints files to refresh hosts, curl loop in the tool's header).
 - User-facing copy: no em dashes.
