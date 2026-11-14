@@ -935,6 +935,40 @@ test("a split prices in proportion to the share and says what it gives up", func
   assert.ok(!/## Split traffic/.test(S.decisionMemo({ res: res, p: p, now: NOW, route: S.routeSplit(res.ranked, p, "low", 0) })), "no section at 0%");
 });
 
+section("Test kit script");
+test("the kit takes the top three plus split and tray picks, once each, up to five, OpenRouter models only", function () {
+  var ms = [1, 2, 3, 4, 5, 6, 7].map(function (i) { return mk({ id: "m" + i, model: "M" + i, openrouter_id: "acme/m" + i, quality_tier: i <= 5 ? 6 - i : 1, input_price_per_mtok: i }); });
+  ms[1].openrouter_id = null; // rank 2 is not on OpenRouter
+  var p = profile(), res = S.rankModels(ms, p, NOW);
+  var ids = S.testKitModels(res, p, ["m6", "m1", "m7", "m5", "nope"]).map(function (m) { return m.id; });
+  var top3 = res.ranked.slice(0, 3).map(function (r) { return r.model.id; }).filter(function (id) { return id !== "m2"; });
+  var expected = top3.concat(["m6", "m1", "m7", "m5"].filter(function (id) { return top3.indexOf(id) < 0; })).slice(0, S.KIT_MAX);
+  assert.deepStrictEqual(ids, expected);
+  assert.deepStrictEqual(S.testKitModels(res, profile({ taskType: "embeddings" }), []), []);
+  var z = mk({ id: "z", openrouter_id: "acme/z", zdr: { endpoints: 1, providers: ["X"], cheapest: "X", input_price_per_mtok: 5, output_price_per_mtok: 9, cache_read_price_per_mtok: null } });
+  var zp = profile({ zdr: true }), kit = S.testKitModels(S.rankModels([z], zp, NOW), zp, []);
+  assert.deepStrictEqual([kit[0].input, kit[0].output], [5, 9], "ZDR raises the kit prices too");
+});
+test("the script reads the key from the environment, escapes names, and keeps the description in one comment line", function () {
+  var py = S.testKitScript({ models: [{ openrouter_id: "acme/a", name: 'Model "A"', input: 1.5, output: null }], zdr: true,
+    description: "Flag clauses\nimport os; os.system('x')", generated: "2026-11-14", catalogDate: "2026-11-14" });
+  assert.ok(/os\.environ\.get\("OPENROUTER_API_KEY"/.test(py) && !/sk-or|api_key\s*=\s*"/i.test(py), "key handling");
+  assert.ok(py.indexOf('("acme/a", "Model \\"A\\"", 1.5, None),') > 0, "model row: " + py.split("\n").filter(function (l) { return /acme/.test(l); })[0]);
+  assert.ok(/^# Task: Flag clauses import os; os\.system\('x'\)$/m.test(py), "description must stay a comment");
+  assert.ok(/^ZDR_ONLY = True /m.test(py) && /body\["provider"\] = \{"zdr": True\}/.test(py));
+  assert.ok(/^ZDR_ONLY = False /m.test(S.testKitScript({ models: [] })));
+  assert.ok(!/\u2014/.test(py));
+  var cp = require("child_process"), os = require("os");
+  var probe = cp.spawnSync("python3", ["--version"]);
+  if (probe.status === 0) {
+    var f = path.join(os.tmpdir(), "model_scout_kit_check_" + process.pid + ".py");
+    fs.writeFileSync(f, py);
+    var r = cp.spawnSync("python3", ["-m", "py_compile", f]);
+    try { fs.unlinkSync(f); } catch (e) { /* already gone */ }
+    assert.strictEqual(r.status, 0, "the script must compile: " + String(r.stderr));
+  }
+});
+
 section("What if one constraint changed");
 test("lever options change one setting and keep the rest", function () {
   var base = S.presetSettings("coding-agent"), opts = S.leverOptions(base);

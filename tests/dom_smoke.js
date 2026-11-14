@@ -642,6 +642,26 @@ test("zero data retention: the checkbox drops models with no ZDR endpoint, repri
   });
 });
 
+test("test kit: lists the shortlist plus the split pick, downloads a script, and is withheld for local only", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
+  var saved = null;
+  p.w.URL.createObjectURL = function (blob) { saved = blob; return "blob:kit"; };
+  p.w.URL.revokeObjectURL = function () {};
+  return settled(p).then(function () {
+    var items = p.d.querySelectorAll("#kit-models li");
+    ok(items.length === 4 && /Grok 4\.7.*top pick/.test(items[0].textContent) && /DeepSeek V4\.1 Flash.*split traffic/.test(items[3].textContent),
+      "kit list: " + p.$("kit-models").textContent);
+    ok(!p.$("kit-download").disabled, "download should be on");
+    p.$("kit-download").click();
+    ok(saved && /model_scout_test\.py with 4 models/.test(p.$("kit-status").textContent), "status: " + p.$("kit-status").textContent);
+    return saved.text ? saved.text() : null;
+  }).then(function (text) {
+    if (text !== null) ok(/"x-ai\/grok-4\.7", "Grok 4\.7"/.test(text) && /ZDR_ONLY = False/.test(text), "script body");
+    p.$("local-only").checked = true; fire(p, "local-only", "change");
+    ok(p.$("kit-download").disabled && /Local only/.test(p.$("kit-models").textContent), "local: " + p.$("kit-models").textContent);
+  });
+});
+
 test("split traffic: pick a cheaper model and a share, see the cost, and the memo carries it", function () {
   var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
   var copied = null;
