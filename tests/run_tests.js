@@ -732,7 +732,8 @@ test("tipping points are exact: just short of each one the pick holds, just past
   assert.ok(checked >= 10, "expected tipping points across the presets, got " + checked);
 });
 test("the nearest tipping point is the smallest move, and the sentence names it", function () {
-  var res = S.rankModels(models, S.profileFromSettings(S.presetSettings("coding-agent")), NOW), tp = S.tippingPoints(res);
+  var res = S.rankModels(models, S.profileFromSettings(S.presetSettings("support")), NOW), tp = S.tippingPoints(res);
+  assert.ok(!tp.near, "support should not be a tie");
   var all = [];
   tp.factors.forEach(function (f) { ["up", "down"].forEach(function (d) { if (f[d]) all.push(Math.abs(f[d].share - f.share)); }); });
   close(Math.abs(tp.nearest.share - tp.nearest.from), Math.min.apply(null, all));

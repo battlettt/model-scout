@@ -531,7 +531,7 @@ test("decision memo: copy puts Markdown on the clipboard; cheaper option shows u
 });
 
 test("tipping points and hand-set weights: try a tip, drag a slider, go back to profile weights", function () {
-  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=agentic&quality=frontier&context=200000&in=200&cache=75&tools=1" });
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&speed=fast&budget=1&in=300&out=30&cache=50" });
   var first;
   return settled(p).then(function () {
     first = p.d.querySelector("#top-pick h3").firstChild.textContent.trim();
