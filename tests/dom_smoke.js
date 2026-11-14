@@ -617,6 +617,12 @@ test("monthly limit: a link with cap leaves out pricier models, offers to lift i
     ok(p.$("monthly-cap").value === "100", "field: " + p.$("monthly-cap").value);
     ok(top() === "DeepSeek V4.1 Flash", "top: " + top());
     ok(/Grok 4\.7[\s\S]*over your \$100 monthly limit/.test(p.$("excluded").textContent), "excluded: " + p.$("excluded").textContent.slice(0, 300));
+    ok(/^\d+ left out: \d+ over your monthly limit/.test(p.$("excluded-summary").textContent), "summary: " + p.$("excluded-summary").textContent);
+    var saved = null;
+    p.w.URL.createObjectURL = function (blob) { saved = blob; return "blob:csv"; };
+    p.w.URL.revokeObjectURL = function () {};
+    p.$("table-csv").click();
+    ok(saved && /Table saved as model-ranking-.*\.csv \(\d+ models\)/.test(p.$("share-status").textContent), "csv status: " + p.$("share-status").textContent);
     var lever = null;
     Array.prototype.forEach.call(p.d.querySelectorAll("#whatif .wi"), function (li) { if (/Remove the \$100 monthly limit/.test(li.textContent)) lever = li; });
     ok(lever && /Grok 4\.7/.test(lever.textContent), "cap lever: " + p.$("whatif").textContent.slice(0, 300));

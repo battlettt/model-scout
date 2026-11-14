@@ -969,6 +969,24 @@ test("the script reads the key from the environment, escapes names, and keeps th
   }
 });
 
+section("Exclusion summary and CSV export");
+test("the exclusion summary counts reasons, most common first", function () {
+  var res = S.rankModels([mk({ id: "e", kind: "embedding" }), mk({ id: "a", input_price_per_mtok: 9 }), mk({ id: "b", input_price_per_mtok: 8 }), mk({ id: "ok", input_price_per_mtok: 0.1, output_price_per_mtok: 0.1 })],
+    profile({ monthlyCap: 50 }), NOW);
+  assert.strictEqual(S.exclusionSummary(res.excluded), "3 left out: 2 over your monthly limit, 1 of the wrong kind for the task.");
+  assert.strictEqual(S.exclusionSummary([]), "");
+  assert.ok(S.rankModels(models, profile({ taskType: "embeddings" }), NOW).excluded.every(function (r) { return r.excludeKind; }), "every exclusion has a kind");
+});
+test("the CSV has one row per ranked model, quotes commas and quotes, and defuses formulas", function () {
+  var res = S.rankModels([mk({ id: "x", model: 'Odd, "quoted" model', provider: "=HYPERLINK(1)" })], profile(), NOW);
+  var lines = S.tableCsv(res, profile()).split("\r\n");
+  assert.strictEqual(lines[0].split(",")[0], "rank"); assert.strictEqual(lines.length, 3); assert.strictEqual(lines[2], "");
+  assert.ok(lines[1].indexOf('"Odd, ""quoted"" model"') > 0 && lines[1].indexOf("'=HYPERLINK(1)") > 0, lines[1]);
+  assert.ok(/,90,1,4,1000000,verified,/.test(lines[1]), "monthly cost and list prices: " + lines[1]);
+  var lp = profile({ localOnly: true }), local = S.rankModels([mk({ id: "o", open_weights: true, local_hardware: "laptop" })], lp, NOW);
+  assert.ok(/,100,,1,4,1000000,/.test(S.tableCsv(local, lp).split("\r\n")[1]), "no monthly cost for local only: " + S.tableCsv(local, lp));
+});
+
 section("What if one constraint changed");
 test("lever options change one setting and keep the rest", function () {
   var base = S.presetSettings("coding-agent"), opts = S.leverOptions(base);
