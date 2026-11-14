@@ -224,6 +224,25 @@ test("cost score falls as price rises", function () {
   assert.ok(S.costScoreFromPrice(1) > S.costScoreFromPrice(20));
   assert.strictEqual(S.costScoreFromPrice(0), 1);
 });
+test("sample token count: about 4 characters per token, 1 per CJK character, space runs count once", function () {
+  assert.strictEqual(S.estimateTokens("Hello world, this is a test.").tokens, 7); // 28 characters
+  assert.strictEqual(S.estimateTokens("\u4f60\u597d\u4e16\u754c").tokens, 4);
+  assert.strictEqual(S.estimateTokens("a" + " ".repeat(40) + "b").tokens, 1); // "a b"
+  assert.strictEqual(S.estimateTokens("x").tokens, 1);
+  [null, undefined, "", "   \n\t "].forEach(function (t) { assert.strictEqual(S.estimateTokens(t).tokens, 0); });
+});
+test("sample estimate: repeated share picks the cache option at or below it, never under the cache minimum", function () {
+  var e = S.sampleEstimate("x".repeat(6000), "y".repeat(800), "z".repeat(1200));
+  assert.deepStrictEqual([e.fixed, e.variable, e.input, e.output], [1500, 200, 1700, 300]);
+  assert.strictEqual(e.cacheShare, 0.75); // 88% repeats, rounded down to an offered option
+  var short = S.sampleEstimate("x".repeat(400), "y".repeat(800), "");
+  assert.ok(short.cacheTooShort && short.cacheShare === 0, "a 100 token prefix is below CACHE_MIN_TOKENS");
+  var low = S.sampleEstimate("x".repeat(4 * S.CACHE_MIN_TOKENS), "y".repeat(16 * S.CACHE_MIN_TOKENS), "");
+  assert.ok(!low.cacheTooShort && low.cacheShare === 0, "20% repeated is under the lowest option");
+  var none = S.sampleEstimate("", "hello there", "");
+  assert.strictEqual(none.cacheShare, 0);
+  assert.strictEqual(none.repeatedShare, 0);
+});
 test("money formatting", function () {
   assert.strictEqual(S.fmtMoney(200), "$200");
   assert.strictEqual(S.fmtMoney(12.5), "$12.50");

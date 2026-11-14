@@ -474,6 +474,25 @@ test("volume helper: requests per day fill the monthly volume fields", function 
   });
 });
 
+test("sample counter: pasted text fills tokens per request and the cache share, and never reaches the share link", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    ok(p.$("sample-apply").disabled, "apply should wait for text");
+    var before = p.$("cards").innerHTML;
+    p.$("sample-fixed").value = "Policy text. ".repeat(500); fire(p, "sample-fixed");
+    p.$("sample-var").value = "Where is my order 4411?"; fire(p, "sample-var");
+    p.$("sample-reply").value = "It shipped on Monday and should arrive Thursday."; fire(p, "sample-reply");
+    ok(p.$("cards").innerHTML === before, "typing a sample re-ranked the models");
+    ok(!p.$("sample-apply").disabled && /cache share will be set to 90%/.test(p.$("sample-readout").textContent), "readout: " + p.$("sample-readout").textContent);
+    p.$("sample-apply").click();
+    ok(p.$("req-in").value === "1631" && p.$("req-out").value === "12", "request fields: " + p.$("req-in").value + " / " + p.$("req-out").value);
+    ok(p.$("cache-share").value === "0.9", "cache share: " + p.$("cache-share").value);
+    ok(/cache share is now 90%/.test(p.$("sample-readout").textContent) && !/will be set/.test(p.$("sample-readout").textContent), "apply message: " + p.$("sample-readout").textContent);
+    ok(p.d.activeElement === p.$("req-day"), "focus should move to requests per day");
+    ok(/cache=90(&|$)/.test(p.w.location.search) && !/Policy|order|shipped/i.test(p.w.location.search), "address: " + p.w.location.search);
+  });
+});
+
 test("value map: one dot per ranked model; hover names it; selecting a folded model opens its card", function () {
   var p = boot({});
   return settled(p).then(function () {
