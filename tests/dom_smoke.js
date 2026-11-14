@@ -530,6 +530,33 @@ test("decision memo: copy puts Markdown on the clipboard; cheaper option shows u
   });
 });
 
+test("tipping points and hand-set weights: try a tip, drag a slider, go back to profile weights", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=agentic&quality=frontier&context=200000&in=200&cache=75&tools=1" });
+  var first;
+  return settled(p).then(function () {
+    first = p.d.querySelector("#top-pick h3").firstChild.textContent.trim();
+    var tries = p.d.querySelectorAll("#tips .tip-try");
+    ok(tries.length >= 1 && tries.length <= 4, "tip rows: " + tries.length);
+    ok(/comes first/.test(p.$("tips").textContent) && p.d.querySelector("#tips .tip.is-nearest"), "nearest tip missing");
+    ok(p.$("weights-reset").hidden && p.$("weights-edit").getAttribute("aria-pressed") === "false", "starts on profile weights");
+    var named = tries[0].closest(".tip").querySelector(".tip-who a").textContent;
+    tries[0].click();
+    var now = p.d.querySelector("#top-pick h3").firstChild.textContent.trim();
+    ok(now === named && now !== first, "try it should put " + named + " first, got " + now);
+    ok(/[?&]w=\d/.test(p.w.location.search), "weights not in the address: " + p.w.location.search);
+    ok(p.d.querySelectorAll('#weights input[type="range"]').length === 5 && !p.$("weights-reset").hidden, "sliders and reset should show");
+    ok(/set by hand/i.test(p.$("weights-h").textContent) && /now comes first/.test(p.$("tips-status").textContent), "heading or status not updated");
+    var slider = p.d.querySelector('#weights input[data-factor="privacy"]');
+    slider.value = "100";
+    slider.dispatchEvent(new p.w.Event("input", { bubbles: true }));
+    ok(p.d.querySelector('#weights input[data-factor="privacy"]') === slider, "a dragged slider must not be rebuilt");
+    ok(/privacy/.test(p.$("weights").textContent) && /-100(&|$)/.test(p.w.location.search), "slider value not used: " + p.w.location.search);
+    p.$("weights-reset").click();
+    ok(p.d.querySelector("#top-pick h3").firstChild.textContent.trim() === first, "reset should restore the original pick");
+    ok(!/[?&]w=/.test(p.w.location.search) && p.$("weights-reset").hidden && !p.d.querySelector('#weights input'), "reset should clear the weights");
+  });
+});
+
 (function run(i) {
   if (i >= cases.length) {
     console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");

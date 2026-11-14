@@ -651,6 +651,118 @@ test("decision memo with nothing ranked says so instead of naming a pick", funct
   assert.ok(/No model meets every hard constraint/.test(md) && !/## Shortlist/.test(md));
 });
 
+section("Hand-set weights and tipping points");
+function exactScore(r, w) { return Object.keys(w).reduce(function (s, k) { return s + w[k] * r.components[k]; }, 0) * r.fit; }
+function exactLeader(ranked, w) {
+  var best = null, bestV = -Infinity;
+  ranked.forEach(function (r) { var v = exactScore(r, w); if (v > bestV + 1e-12) { bestV = v; best = r; } });
+  return best;
+}
+test("hand-set weights are normalised; negative, missing, or all-zero weights are refused", function () {
+  var w = S.normalizeWeights({ cost: 2, quality: 2, latency: 1, context: 0, privacy: 0 });
+  close(sumW(w), 1); close(w.cost, 0.4); close(w.context, 0);
+  assert.strictEqual(S.normalizeWeights({ cost: -1, quality: 2, latency: 1, context: 1, privacy: 1 }), null);
+  assert.strictEqual(S.normalizeWeights({ cost: 0, quality: 0, latency: 0, context: 0, privacy: 0 }), null);
+  assert.strictEqual(S.normalizeWeights({ cost: 1, quality: 1 }), null);
+  assert.strictEqual(S.normalizeWeights(null), null);
+});
+test("hand-set weights replace the profile weights, whatever the constraints say", function () {
+  var w = S.computeWeights(profile({ budget: 0.5, latency: "fast", weights: { cost: 0, quality: 1, latency: 0, context: 0, privacy: 0 } }));
+  close(w.quality, 1); close(w.cost, 0);
+  var res = S.rankModels([mk({ id: "cheap", quality_tier: 2, input_price_per_mtok: 0.1 }), mk({ id: "best", quality_tier: 5, input_price_per_mtok: 20, output_price_per_mtok: 60 })],
+    profile({ weights: { cost: 0, quality: 1, latency: 0, context: 0, privacy: 0 } }), NOW);
+  assert.strictEqual(res.ranked[0].model.id, "best");
+});
+test("hand-set weights travel in the link with one decimal, and bad ones are skipped", function () {
+  var s = { weights: { cost: 15, quality: 42.1, latency: 13.5, context: 27.1, privacy: 2.3 } };
+  var qs = S.encodeSettings(s);
+  assert.ok(/(^|&)w=15-42\.1-13\.5-27\.1-2\.3(&|$)/.test(qs), qs);
+  assert.deepStrictEqual(S.decodeSettings(qs).settings.weights, s.weights);
+  ["w=1-2-3", "w=0-0-0-0-0", "w=101-0-0-0-0", "w=a-b-c-d-e", "w=1.25-1-1-1-1", "w=-1-2-3-4-5"].forEach(function (bad) {
+    var d = S.decodeSettings(bad);
+    assert.ok(!("weights" in d.settings) && d.ignored.indexOf("w") >= 0, bad + " should be skipped");
+  });
+  assert.ok(!/w=/.test(S.encodeSettings(S.DEFAULT_SETTINGS)), "no weights in a default link");
+  close(sumW(S.profileFromSettings(s).weights), 1);
+  assert.strictEqual(S.profileFromSettings({}).weights, null);
+});
+test("weightsAt keeps the other weights in proportion; sharesToPercents always adds up to 100", function () {
+  var w = { cost: 0.2, quality: 0.4, latency: 0.2, context: 0.1, privacy: 0.1 };
+  var at = S.weightsAt(w, "cost", 0.6);
+  close(at.cost, 0.6); close(sumW(at), 1); close(at.quality / at.latency, 2);
+  [w, at, S.computeWeights(profile()), { cost: 1 / 3, quality: 1 / 3, latency: 1 / 3, context: 0, privacy: 0 }].forEach(function (x) {
+    var p = S.sharesToPercents(x);
+    assert.strictEqual(Object.keys(p).reduce(function (s, k) { return s + p[k]; }, 0), 100);
+  });
+});
+test("tipping points are exact: just short of each one the pick holds, just past it the named model leads", function () {
+  var checked = 0;
+  S.PRESETS.forEach(function (pr) {
+    var res = S.rankModels(models, S.profileFromSettings(S.presetSettings(pr.id)), NOW), tp = S.tippingPoints(res);
+    if (!tp || tp.near) return;
+    var top = res.ranked[0];
+    tp.factors.forEach(function (f) {
+      ["up", "down"].forEach(function (dir) {
+        var sign = dir === "up" ? 1 : -1, tip = f[dir];
+        if (tip) {
+          assert.strictEqual(exactLeader(res.ranked, S.weightsAt(res.weights, f.key, tip.share - sign * 1e-4)), top, pr.id + " " + f.key + " " + dir + ": pick changed early");
+          assert.strictEqual(exactLeader(res.ranked, S.weightsAt(res.weights, f.key, tip.share + sign * 1e-4)).model.id, tip.model.id, pr.id + " " + f.key + " " + dir + ": wrong model past the tip");
+          checked++;
+        } else {
+          for (var i = 1; i <= 40; i++) {
+            var t = f.share + sign * (i / 40) * (dir === "up" ? 1 - f.share - 0.001 : f.share - 0.001);
+            assert.strictEqual(exactLeader(res.ranked, S.weightsAt(res.weights, f.key, t)), top, pr.id + " " + f.key + " " + dir + " at " + t + ": no tip reported, but the pick changed");
+          }
+        }
+      });
+    });
+  });
+  assert.ok(checked >= 10, "expected tipping points across the presets, got " + checked);
+});
+test("the nearest tipping point is the smallest move, and the sentence names it", function () {
+  var res = S.rankModels(models, S.profileFromSettings(S.presetSettings("coding-agent")), NOW), tp = S.tippingPoints(res);
+  var all = [];
+  tp.factors.forEach(function (f) { ["up", "down"].forEach(function (d) { if (f[d]) all.push(Math.abs(f[d].share - f.share)); }); });
+  close(Math.abs(tp.nearest.share - tp.nearest.from), Math.min.apply(null, all));
+  var s = S.tipSentence(tp);
+  assert.ok(s.indexOf(tp.nearest.model.model) >= 0 && /^The pick changes soonest if the weight on /.test(s), s);
+});
+test("twins, a lone model, and a model that wins on every factor each get their own answer", function () {
+  var twins = S.tippingPoints(S.rankModels([mk({ id: "a", model: "A" }), mk({ id: "b", model: "B" })], profile(), NOW));
+  assert.ok(twins.near && twins.twin && /no weighting separates them/.test(S.tipSentence(twins)));
+  var lone = S.tippingPoints(S.rankModels([mk({ id: "a" })], profile(), NOW));
+  assert.ok(lone.single && /Only one model/.test(S.tipSentence(lone)));
+  var dom = S.tippingPoints(S.rankModels([mk({ id: "a", input_price_per_mtok: 0.5 }), mk({ id: "b", input_price_per_mtok: 1 })], profile(), NOW));
+  assert.strictEqual(dom.nearest, null);
+  assert.ok(/No single weight/.test(S.tipSentence(dom)));
+  assert.strictEqual(S.tippingPoints({ ranked: [], weights: {} }), null);
+});
+test("shareLabel adds a decimal only when two shares would otherwise read the same", function () {
+  assert.strictEqual(S.shareLabel(0.0449, 0.038), "4.5%");
+  assert.strictEqual(S.shareLabel(0.15, 0.31), "15%");
+});
+test("tipWeights returns whole percentages past the tip that really put the named model first", function () {
+  var p = S.profileFromSettings(S.presetSettings("support")), res = S.rankModels(models, p, NOW), n = S.tippingPoints(res).nearest;
+  var out = S.tipWeights(models, p, NOW, n.key, n.dir);
+  assert.ok(out, "no weights found");
+  assert.strictEqual(Object.keys(out.weights).reduce(function (s, k) { return s + out.weights[k]; }, 0), 100);
+  var q = Object.assign({}, p, { weights: out.weights });
+  assert.strictEqual(S.rankModels(models, q, NOW).ranked[0].model.id, out.model.id);
+  assert.notStrictEqual(out.model.id, res.ranked[0].model.id);
+  assert.strictEqual(S.tipWeights(models, p, NOW, "nope", "up"), null);
+});
+test("the memo names the tipping point and says when weights were set by hand", function () {
+  var p = profile({ weights: S.normalizeWeights({ cost: 1, quality: 3, latency: 1, context: 1, privacy: 0 }) });
+  var cheap = mk({ id: "cheap", model: "Cheap", quality_tier: 3, input_price_per_mtok: 0.1, output_price_per_mtok: 0.4 });
+  var strong = mk({ id: "strong", model: "Strong", quality_tier: 5, input_price_per_mtok: 3, output_price_per_mtok: 12 });
+  var res = S.rankModels([cheap, strong], p, NOW);
+  var md = S.decisionMemo({ res: res, p: p, now: NOW, tips: S.tippingPoints(res) });
+  assert.ok(/- Weights: set by hand, cost 17%, quality 50%/.test(md), md);
+  assert.ok(/- Tipping point: The pick changes soonest if the weight on /.test(md), md);
+  var md2 = S.decisionMemo({ res: res, p: profile(), now: NOW });
+  assert.ok(/- Weights: from the profile/.test(md2) && !/Tipping point/.test(md2));
+});
+
 section("Catalog refresh tool");
 var refreshTool = require("../tools/refresh_catalog.js");
 test("refresh updates listed figures and leaves editorial fields alone", function () {

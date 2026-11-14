@@ -36,6 +36,7 @@
   var MAX_CACHE_SHARE = 0.95;
   var ROBUST_SAMPLES = 300;
   var ROBUST_SPREAD = Math.log(2); // each weight is scaled by a factor between 1/2 and 2
+  var TIP_EDGE = 0.0005; // tipping points within 0.05 points of 0% or 100% are ties at the edge, not reported
   var DAYS_PER_MONTH = 365 / 12;
 
   // ---------- small helpers ----------
@@ -171,8 +172,26 @@
   }
 
   // ---------- weights ----------
-  /** Weights respond to the user's constraints and always sum to 1. */
+  var FACTORS = ["cost", "quality", "latency", "context", "privacy"];
+
+  /** Hand-set weights as shares that sum to 1, or null when they are missing, negative, or all zero. */
+  function normalizeWeights(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    var out = {}, sum = 0;
+    for (var i = 0; i < FACTORS.length; i++) {
+      var v = raw[FACTORS[i]];
+      if (!isNum(v) || v < 0) return null;
+      out[FACTORS[i]] = v; sum += v;
+    }
+    if (!(sum > 0)) return null;
+    FACTORS.forEach(function (k) { out[k] = out[k] / sum; });
+    return out;
+  }
+
+  /** Weights respond to the user's constraints and always sum to 1. Hand-set weights (p.weights) replace them. */
   function computeWeights(p) {
+    var custom = normalizeWeights(p && p.weights);
+    if (custom) return custom;
     var w = { cost: 1, quality: 1, latency: 0.6, context: 0.6, privacy: 0.15 };
     if (isNum(p.budget) && p.budget > 0) {
       if (p.budget <= 1) w.cost += 1.5;
@@ -432,6 +451,122 @@
     };
   }
 
+  // ---------- tipping points: how far each weight can move before the pick changes ----------
+  /** Weights with one factor's share set to t and the others scaled to keep their proportions. */
+  function weightsAt(w, key, t) {
+    var rest = 1 - w[key], out = {};
+    t = clamp(t, 0, 1);
+    Object.keys(w).forEach(function (k) {
+      if (k === key) out[k] = t;
+      else out[k] = rest > 1e-12 ? w[k] * (1 - t) / rest : (1 - t) / (Object.keys(w).length - 1);
+    });
+    return out;
+  }
+
+  /** Shares as whole percentages that add up to exactly 100 (largest remainder). */
+  function sharesToPercents(w) {
+    var keys = Object.keys(w), floors = {}, used = 0;
+    keys.forEach(function (k) { floors[k] = Math.floor(w[k] * 100); used += floors[k]; });
+    keys.slice().sort(function (a, b) { return (w[b] * 100 - floors[b]) - (w[a] * 100 - floors[a]); })
+      .slice(0, Math.max(0, 100 - used)).forEach(function (k) { floors[k]++; });
+    return floors;
+  }
+
+  /**
+   * Exact tipping points for the top pick. Move one factor's weight share up or down, with the other weights
+   * keeping their proportions, and find the nearest share at which another model comes first. Every score is
+   * a straight line in that share, so each crossing is solved exactly rather than sampled.
+   * Returns null when nothing is ranked; { near: true, model } when a rival is already level with the top pick
+   * before rounding; otherwise { factors: [{ key, share, up, down }], nearest }, where up and down are
+   * { share, model } or null when no share in that direction changes the pick, and nearest is the closest
+   * tipping point of all ({ key, dir, from, share, model }) or null.
+   */
+  function tippingPoints(res) {
+    var ranked = res && res.ranked;
+    if (!ranked || !ranked.length) return null;
+    var w = res.weights, keys = Object.keys(w), top = ranked[0], EPS = 1e-9;
+    function exact(r) { var v = 0; keys.forEach(function (k) { v += w[k] * r.components[k]; }); return v * r.fit; }
+    var lead = exact(top);
+    for (var i = 1; i < ranked.length; i++) {
+      if (exact(ranked[i]) < lead - EPS) continue;
+      var rival = ranked[i], twin = keys.every(function (k) { return Math.abs(top.components[k] * top.fit - rival.components[k] * rival.fit) <= EPS; });
+      return { near: true, twin: twin, model: rival.model, factors: [], nearest: null };
+    }
+    var nearest = null;
+    var factors = keys.map(function (k) {
+      var wk = w[k], out = { key: k, share: wk, up: null, down: null };
+      if (wk >= 1 - EPS || ranked.length < 2) return out;
+      function line(r) {
+        var rest = 0;
+        keys.forEach(function (j) { if (j !== k) rest += w[j] * r.components[j]; });
+        rest = rest / (1 - wk);
+        return { a: r.fit * rest, b: r.fit * (r.components[k] - rest) };
+      }
+      var T = line(top), up = null, down = null;
+      for (var n = 1; n < ranked.length; n++) {
+        var L = line(ranked[n]), db = L.b - T.b;
+        if (Math.abs(db) < 1e-12) continue;
+        var t = (T.a - L.a) / db;
+        // A crossing at the very end of the range (all or none of the weight) is a tie there, not a change of pick.
+        if (db > 0 && t > wk + EPS && t <= 1 - TIP_EDGE) {
+          if (!up || t < up.t - EPS || (Math.abs(t - up.t) <= EPS && L.b > up.b)) up = { t: t, b: L.b, model: ranked[n].model };
+        } else if (db < 0 && t < wk - EPS && t >= TIP_EDGE) {
+          if (!down || t > down.t + EPS || (Math.abs(t - down.t) <= EPS && L.b < down.b)) down = { t: t, b: L.b, model: ranked[n].model };
+        }
+      }
+      if (up) out.up = { share: up.t, model: up.model };
+      if (down) out.down = { share: down.t, model: down.model };
+      [["up", out.up], ["down", out.down]].forEach(function (d) {
+        if (d[1] && (!nearest || Math.abs(d[1].share - wk) < Math.abs(nearest.share - nearest.from))) {
+          nearest = { key: k, dir: d[0], from: wk, share: d[1].share, model: d[1].model };
+        }
+      });
+      return out;
+    });
+    return { near: false, single: ranked.length < 2, factors: factors, nearest: nearest };
+  }
+
+  /** A share as a percentage, with one decimal when it would otherwise round to the same figure as ref. */
+  function shareLabel(t, ref) {
+    var a = Math.round(t * 100);
+    return (isNum(ref) && a === Math.round(ref * 100) ? (t * 100).toFixed(1) : String(a)) + "%";
+  }
+
+  /** One sentence on the nearest tipping point, for the memo and the results panel. */
+  function tipSentence(tp) {
+    if (!tp) return "";
+    if (tp.near && tp.twin) return "Ties " + tp.model.model + " on every factor, so no weighting separates them.";
+    if (tp.near) return "Level with " + tp.model.model + " before rounding, so a small change in the weights can swap them.";
+    if (tp.single) return "Only one model passes the hard constraints, so no weighting changes the pick.";
+    var n = tp.nearest;
+    if (!n) return "No single weight, moved anywhere from 0% to 100%, puts another model first.";
+    return "The pick changes soonest if the weight on " + COMPONENT_LABELS[n.key] + " " + (n.dir === "up" ? "rises" : "falls") +
+      " from " + shareLabel(n.from, n.share) + " to " + shareLabel(n.share, n.from) + ". Then " + n.model.model + " comes first.";
+  }
+
+  /**
+   * Whole-percent weights just past one tipping point, checked by re-ranking: the smallest step past the
+   * crossing (up to 5 points) at which a different model comes first. Returns { weights, model } or null.
+   */
+  function tipWeights(models, p, now, key, dir) {
+    var res = rankModels(models, p, now), tp = tippingPoints(res);
+    if (!tp || tp.near) return null;
+    var f = null;
+    tp.factors.forEach(function (x) { if (x.key === key) f = x; });
+    var tip = f && f[dir];
+    if (!tip) return null;
+    var topId = res.ranked[0].model.id, sign = dir === "up" ? 1 : -1;
+    for (var step = 1; step <= 10; step++) {
+      var t = clamp(tip.share + sign * step * 0.005, 0, 1);
+      var whole = sharesToPercents(weightsAt(res.weights, key, t));
+      var q = {}; Object.keys(p).forEach(function (k2) { q[k2] = p[k2]; });
+      q.weights = whole;
+      var r2 = rankModels(models, q, now);
+      if (r2.ranked[0] && r2.ranked[0].model.id !== topId) return { weights: whole, model: r2.ranked[0].model };
+    }
+    return null;
+  }
+
   // ---------- value map: score against monthly cost ----------
   /** Pareto frontier for "higher score, lower cost": ids of points that no other point beats on both, in cost order. */
   function frontier(points) {
@@ -593,6 +728,7 @@
       "Budget: " + (isNum(p.budget) ? "$" + p.budget + " per million tokens, blended" : "no limit"),
       "Privacy: " + (p.localOnly ? "local only, open weights on our own hardware" : "hosted providers allowed"),
       "Must support: " + (needs.length ? needs.join(", ") : "nothing beyond text generation"),
+      "Weights: " + (p.weights ? "set by hand, " + FACTORS.map(function (k) { return COMPONENT_LABELS[k] + " " + Math.round(p.weights[k] * 100) + "%"; }).join(", ") : "from the profile"),
       "Volume: " + fmtVolume(p.inputTokens) + " input and " + fmtVolume(p.outputTokens) + " output tokens a month" +
         (p.cacheShare > 0 ? ", " + Math.round(p.cacheShare * 100) + "% of input from the prompt cache" : "") + (p.useBatch ? ", batch prices where offered" : "")
     ];
@@ -600,7 +736,7 @@
 
   /**
    * A Markdown memo for the decision: requirements, the pick and why, confidence, a cheaper option, runners-up,
-   * exclusions, caveats, and when to revisit. ctx: { res, p, description, rb, alt, now, catalogDate, liveAt, link }.
+   * exclusions, caveats, and when to revisit. ctx: { res, p, description, rb, alt, tips, now, catalogDate, liveAt, link }.
    */
   function decisionMemo(ctx) {
     var res = ctx.res, p = ctx.p, top = res.ranked[0], L = [];
@@ -627,6 +763,7 @@
         L.push("- Confidence: " + (ctx.rb.verdict === "tie" ? "tied on every factor with " + ctx.rb.runnerUp.model.model + "; either works." :
           { stable: "stable", likely: "likely", close: "close call" }[ctx.rb.verdict] + ", first in " + Math.round(ctx.rb.topShare * 100) + "% of " + ctx.rb.samples + " reruns with each weight between half and double."));
       }
+      if (ctx.tips && !ctx.tips.single) L.push("- Tipping point: " + tipSentence(ctx.tips));
       if (ctx.alt) L.push("- Cheaper option within " + SWITCH_MARGIN + " points: " + ctx.alt.model.model + " scores " + ctx.alt.total + " for " + fmtMoney(ctx.alt.cost) + " a month, saving " + fmtMoney(ctx.alt.saves) + ".");
       var flags = dataFlags(top.model, ctx.now).map(function (f) { return f.text; }).concat(top.flags);
       flags.forEach(function (f) { L.push("- Check: " + f); });
@@ -779,7 +916,8 @@
   // turns them into the profile the engine scores against.
   var DEFAULT_SETTINGS = {
     taskType: "chat", modality: "text", quality: "good", latency: "balanced", contextNeed: 32000, budget: null,
-    localOnly: false, inputM: 50, outputM: 10, cacheShare: 0, useBatch: false, tools: false, json: false, reasoning: false
+    localOnly: false, inputM: 50, outputM: 10, cacheShare: 0, useBatch: false, tools: false, json: false, reasoning: false,
+    weights: null
   };
   var SETTING_CHOICES = {
     taskType: ["chat", "code", "rag", "vision", "embeddings", "agentic"],
@@ -792,7 +930,8 @@
   var BOOL_SETTINGS = ["localOnly", "useBatch", "tools", "json", "reasoning"];
   var URL_KEYS = {
     taskType: "task", modality: "input", quality: "quality", latency: "speed", contextNeed: "context", budget: "budget",
-    localOnly: "local", inputM: "in", outputM: "out", cacheShare: "cache", useBatch: "batch", tools: "tools", json: "json", reasoning: "reasoning"
+    localOnly: "local", inputM: "in", outputM: "out", cacheShare: "cache", useBatch: "batch", tools: "tools", json: "json", reasoning: "reasoning",
+    weights: "w"
   };
   var PRESETS = [
     { id: "support", name: "Support bot", description: "Answer customer questions from our help center articles, quickly, at high volume",
@@ -832,7 +971,8 @@
       contextNeed: isNum(f.contextNeed) ? f.contextNeed : 0, budget: isNum(f.budget) && f.budget > 0 ? f.budget : null,
       localOnly: !!f.localOnly, inputTokens: tok(f.inputM), outputTokens: tok(f.outputM),
       cacheShare: isNum(f.cacheShare) ? clamp(f.cacheShare, 0, MAX_CACHE_SHARE) : 0, useBatch: !!f.useBatch,
-      needs: { tools: !!f.tools, json: !!f.json, reasoning: !!f.reasoning }
+      needs: { tools: !!f.tools, json: !!f.json, reasoning: !!f.reasoning },
+      weights: normalizeWeights(f.weights)
     };
   }
 
@@ -843,6 +983,10 @@
       var v = f[k];
       if (v === DEFAULT_SETTINGS[k] || v === null || v === undefined) return;
       if (k === "cacheShare") v = Math.round(v * 100);
+      if (k === "weights") {
+        if (!normalizeWeights(v)) return;
+        v = FACTORS.map(function (x) { return String(round(v[x], 1)); }).join("-");
+      }
       if (v === true) v = 1;
       if (v === false) v = 0;
       parts.push(URL_KEYS[k] + "=" + encodeURIComponent(String(v)));
@@ -856,6 +1000,13 @@
     if (k === "cacheShare") { x = Number(raw) / 100; return SETTING_CHOICES.cacheShare.indexOf(x) >= 0 ? x : undefined; }
     if (SETTING_CHOICES[k]) return SETTING_CHOICES[k].indexOf(raw) >= 0 ? raw : undefined;
     if (BOOL_SETTINGS.indexOf(k) >= 0) return raw === "1" ? true : raw === "0" ? false : undefined;
+    if (k === "weights") {
+      var parts = String(raw).split("-");
+      if (parts.length !== FACTORS.length || !parts.every(function (d) { return /^\d{1,3}(\.\d)?$/.test(d) && Number(d) <= 100; })) return undefined;
+      var wv = {};
+      FACTORS.forEach(function (f, i) { wv[f] = Number(parts[i]); });
+      return normalizeWeights(wv) ? wv : undefined;
+    }
     if (raw === "" || !/^\d*\.?\d+$/.test(raw)) return undefined;
     x = Number(raw);
     if (k === "budget") return x > 0 && x <= 1000 ? x : undefined;
@@ -1183,6 +1334,8 @@
     robustness: robustness, presetSettings: presetSettings, profileFromSettings: profileFromSettings,
     encodeSettings: encodeSettings, decodeSettings: decodeSettings,
     frontier: frontier, cheaperAlternative: cheaperAlternative, valueMapSvg: valueMapSvg, headToHead: headToHead, decisionMemo: decisionMemo,
+    FACTORS: FACTORS, normalizeWeights: normalizeWeights, weightsAt: weightsAt, sharesToPercents: sharesToPercents,
+    tippingPoints: tippingPoints, tipWeights: tipWeights, tipSentence: tipSentence, shareLabel: shareLabel,
     OPENROUTER_CHAT_URL: OPENROUTER_CHAT_URL, OLLAMA_CHAT_URL: OLLAMA_CHAT_URL, LOCAL_MODEL: LOCAL_MODEL,
     DEFAULT_CHAT_MODEL: DEFAULT_CHAT_MODEL, FEATURED_CHAT_MODELS: FEATURED_CHAT_MODELS, KEY_STORAGE: KEY_STORAGE,
     buildChatRequest: buildChatRequest, chatText: chatText, httpErrorText: httpErrorText, localModeCheck: localModeCheck,
@@ -1197,8 +1350,10 @@
   // =====================================================================
   var CARD_LIMIT = 6;
   var state = { catalog: null, catalogOrigin: "", base: [], liveOnly: [], live: null, liveIds: null, now: new Date(), lastOrder: null,
-    touched: false, showAllCards: false, linkNote: "", compare: [], lastRes: null, lastProfile: null };
+    touched: false, showAllCards: false, linkNote: "", compare: [], lastRes: null, lastProfile: null,
+    customWeights: null, editWeights: false };
   var COMPARE_MAX = 3;
+  var TIP_ROWS = 4;
 
   function $(id) { return document.getElementById(id); }
   function esc(s) {
@@ -1222,8 +1377,11 @@
       inputM: num("vol-in"), outputM: num("vol-out"), cacheShare: parseFloat($("cache-share").value) || 0
     };
     Object.keys(CHECK_IDS).forEach(function (k) { s[k] = $(CHECK_IDS[k]).checked; });
+    s.weights = state.customWeights ? copyWeights(state.customWeights) : null;
     return s;
   }
+
+  function copyWeights(w) { var o = {}; FACTORS.forEach(function (k) { o[k] = w[k]; }); return o; }
 
   /** Put settings into the form. Only the keys present change. */
   function applySettings(s) {
@@ -1232,6 +1390,10 @@
     if ("budget" in s) $("budget").value = s.budget == null ? "" : String(s.budget);
     if ("inputM" in s) $("vol-in").value = String(s.inputM);
     if ("outputM" in s) $("vol-out").value = String(s.outputM);
+    if ("weights" in s) {
+      state.customWeights = normalizeWeights(s.weights) ? copyWeights(s.weights) : null;
+      if (!state.customWeights) state.editWeights = false;
+    }
   }
 
   function readProfile() {
@@ -1260,12 +1422,102 @@
     return '<span class="badge ok">Verified ' + esc(String(m.last_verified).slice(0, 10)) + "</span>";
   }
 
+  var WEIGHTS_NOTE = "Weights shift with your constraints: a tight budget raises cost, a long input raises context fit, local-only raises privacy.";
+  var CUSTOM_NOTE = "Set by hand, so your constraints no longer move these weights. Hard limits (input type, local only, required capabilities) still apply. Each slider sets relative importance; the shares add up to 100%.";
+
+  /** The weights box: bars for profile weights, sliders while setting them by hand. Sliders update in place so one being dragged keeps focus. */
   function renderWeights(w) {
-    var html = Object.keys(w).map(function (k) {
-      return '<li><span class="wname">' + COMPONENT_LABELS[k] + '</span>' + bar(w[k] / 0.5 > 1 ? 1 : w[k] / 0.5) +
-        '<span class="wval">' + pct(w[k]) + "%</span></li>";
+    var list = $("weights"), custom = !!state.customWeights, editing = custom && state.editWeights;
+    if (editing && list.getAttribute("data-mode") === "edit") {
+      FACTORS.forEach(function (k) {
+        var input = $("w-" + k);
+        if (!input) return;
+        input.setAttribute("aria-valuetext", pct(w[k]) + "% of the weight");
+        if (document.activeElement !== input) input.value = String(Math.round(state.customWeights[k]));
+        input.parentNode.querySelector(".wval").textContent = pct(w[k]) + "%";
+      });
+    } else {
+      list.innerHTML = FACTORS.map(function (k) {
+        var name = COMPONENT_LABELS[k];
+        if (editing) {
+          return '<li class="is-edit"><label class="wname" for="w-' + k + '">' + name + "</label>" +
+            '<input type="range" id="w-' + k + '" data-factor="' + k + '" min="0" max="100" step="1" value="' + Math.round(state.customWeights[k]) +
+            '" aria-valuetext="' + pct(w[k]) + '% of the weight"><span class="wval">' + pct(w[k]) + "%</span></li>";
+        }
+        return '<li><span class="wname">' + name + "</span>" + bar(w[k] / 0.5 > 1 ? 1 : w[k] / 0.5) + '<span class="wval">' + pct(w[k]) + "%</span></li>";
+      }).join("");
+      list.setAttribute("data-mode", editing ? "edit" : "view");
+    }
+    $("weights-edit").setAttribute("aria-pressed", String(editing));
+    $("weights-reset").hidden = !custom;
+    $("weights-h").textContent = custom ? "Your weights, set by hand" : "How your profile weights each factor";
+    $("weights-note").textContent = custom ? CUSTOM_NOTE : WEIGHTS_NOTE;
+  }
+
+  /** "What would change the pick": the nearest tipping points, each with a button that tries it. */
+  function renderTips(res) {
+    var tp = tippingPoints(res), list = $("tips");
+    state.lastTips = tp;
+    if (!tp) { list.innerHTML = '<li class="tip-none">No pick to test: every model failed a hard constraint.</li>'; return; }
+    if (tp.near || tp.single) { list.innerHTML = '<li class="tip-none">' + esc(tipSentence(tp)) + "</li>"; return; }
+    var rows = [];
+    tp.factors.forEach(function (f) {
+      ["up", "down"].forEach(function (dir) { if (f[dir]) rows.push({ f: f, dir: dir, tip: f[dir], dist: Math.abs(f[dir].share - f.share) }); });
+    });
+    rows.sort(function (a, b) { return a.dist - b.dist; });
+    var fixed = tp.factors.filter(function (f) { return !f.up && !f.down; }).map(function (f) { return COMPONENT_LABELS[f.key]; });
+    var html = rows.slice(0, TIP_ROWS).map(function (r, i) {
+      var label = COMPONENT_LABELS[r.f.key];
+      return '<li class="tip' + (i === 0 ? " is-nearest" : "") + '">' +
+        '<p class="tip-move"><span class="tip-factor">' + esc(label.charAt(0).toUpperCase() + label.slice(1)) + "</span> " +
+          (r.dir === "up" ? "rises" : "falls") + " from " + shareLabel(r.f.share, r.tip.share) + " to <strong>" + shareLabel(r.tip.share, r.f.share) + "</strong></p>" +
+        '<p class="tip-who"><a href="#card-' + esc(r.tip.model.id) + '">' + esc(r.tip.model.model) + "</a> comes first</p>" +
+        '<button type="button" class="btn btn-small tip-try" data-tip-key="' + r.f.key + '" data-tip-dir="' + r.dir + '" aria-label="Try it: set ' +
+          esc(label) + " to " + shareLabel(r.tip.share, r.f.share) + ", where " + esc(r.tip.model.model) + ' comes first">Try it</button></li>';
     }).join("");
-    $("weights").innerHTML = html;
+    if (!rows.length) html = '<li class="tip-none">' + esc(tipSentence(tp)) + "</li>";
+    if (fixed.length && rows.length) {
+      html += '<li class="tip-none">' + esc(listWords(fixed).charAt(0).toUpperCase() + listWords(fixed).slice(1)) + ": no share from 0% to 100% changes the pick.</li>";
+    }
+    list.innerHTML = html;
+  }
+
+  function listWords(a) { return a.length < 2 ? a.join("") : a.slice(0, -1).join(", ") + " and " + a[a.length - 1]; }
+
+  function tryTip(key, dir) {
+    var p = readProfile(), out = tipWeights(candidates(), p, state.now, key, dir), status = $("tips-status");
+    if (!out) { status.textContent = "Could not find weights past that point. Set them by hand instead."; return; }
+    state.customWeights = copyWeights(out.weights);
+    state.editWeights = true;
+    state.touched = true;
+    markPreset("");
+    render();
+    status.textContent = "Weights set by hand: " + out.model.model + " now comes first. Back to profile weights undoes it.";
+    $("weights-reset").focus();
+  }
+
+  function toggleWeightEdit() {
+    if (state.customWeights && state.editWeights) state.editWeights = false;
+    else {
+      if (!state.customWeights && state.lastRes) {
+        var w = state.lastRes.weights;
+        state.customWeights = {};
+        FACTORS.forEach(function (k) { state.customWeights[k] = round(w[k] * 100, 1); });
+      }
+      state.editWeights = !!state.customWeights;
+    }
+    state.touched = true;
+    render();
+    var first = state.editWeights ? $("weights").querySelector("input") : null;
+    if (first) first.focus();
+  }
+
+  function resetWeights() {
+    state.customWeights = null;
+    state.editWeights = false;
+    $("tips-status").textContent = "Back to the weights your profile sets.";
+    render();
+    $("weights-edit").focus();
   }
 
   function costCell(r, p) {
@@ -1376,6 +1628,7 @@
     var p = readProfile();
     var res = rankModels(candidates(), p, state.now);
     renderWeights(res.weights);
+    renderTips(res);
     state.lastRes = res;
     state.lastProfile = p;
     var top = res.ranked[0];
@@ -1618,7 +1871,7 @@
   function memoText() {
     var p = readProfile(), res = rankModels(candidates(), p, state.now);
     return decisionMemo({
-      res: res, p: p, description: $("task-desc").value, rb: robustness(res), alt: cheaperAlternative(res.ranked, p),
+      res: res, p: p, description: $("task-desc").value, rb: robustness(res), alt: cheaperAlternative(res.ranked, p), tips: tippingPoints(res),
       now: new Date(), catalogDate: state.catalog && state.catalog.catalog_date,
       liveAt: state.live && state.live.ok ? state.live.fetchedAt.toLocaleString() : null, link: shareUrl()
     });
@@ -2238,6 +2491,21 @@
       resizeTimer = setTimeout(function () {
         if (state.lastRes && Math.abs($("value-map").clientWidth - (state.mapWidth || 0)) > 30) renderValueMap(state.lastRes, state.lastProfile);
       }, 150);
+    });
+    $("weights-edit").addEventListener("click", toggleWeightEdit);
+    $("weights-reset").addEventListener("click", resetWeights);
+    $("weights").addEventListener("input", function (e) {
+      var k = e.target && e.target.getAttribute && e.target.getAttribute("data-factor");
+      if (!k || !state.customWeights) return;
+      state.customWeights[k] = Number(e.target.value);
+      if (!normalizeWeights(state.customWeights)) { state.customWeights[k] = 1; e.target.value = "1"; } // never all zero
+      state.touched = true;
+      markPreset("");
+      render();
+    });
+    $("tips").addEventListener("click", function (e) {
+      var b = e.target && e.target.closest ? e.target.closest(".tip-try") : null;
+      if (b) tryTip(b.getAttribute("data-tip-key"), b.getAttribute("data-tip-dir"));
     });
     $("memo-copy").addEventListener("click", copyMemo);
     $("memo-download").addEventListener("click", downloadMemo);

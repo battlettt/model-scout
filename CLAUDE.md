@@ -14,6 +14,8 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - Hard capability constraints (tool calling, JSON output, reasoning mode), prompt-cache share and batch prices in the cost math, retirement dates as warnings.
 - Confidence check on the top pick (`robustness`): 300 seeded reruns with each weight scaled between half and double; reports ties and dominated runners-up.
 - Value map (`valueMapSvg`, `frontier`): score against monthly cost on a log scale, with the Pareto frontier; drawn at the container width. "Cheaper option within 5 points" under the top pick (`cheaperAlternative`).
+- Tipping points (`tippingPoints`): per factor, the exact weight share at which another model comes first (scores are linear in one share when the others keep their proportions). "Try it" (`tipWeights`) sets whole-percent weights just past the tip, verified by re-ranking.
+- Hand-set weights (`normalizeWeights`, link key `w=cost-quality-speed-context-privacy`, one decimal): sliders in the weights box replace the profile weights; hard constraints still apply. "Back to profile weights" clears them.
 - Compare tray and head to head (`headToHead`, up to 3 models), with "Ask the first two side by side". Decision memo as Markdown (`decisionMemo`): copy or download; it includes the description, the share link does not.
 
 ## Run

@@ -304,6 +304,35 @@ input[aria-invalid="true"] { border-color: var(--warn); border-bottom-width: 2px
 .wval { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight: 600; }
 .small-print { font-size: 0.875rem; margin: 0; }
 
+/* ---------- weights set by hand, and tipping points ---------- */
+.results-side { display: grid; gap: var(--s4); align-content: start; min-width: 0; }
+.weights-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s2) var(--s3); }
+.weights-head h3 { margin: 0; }
+.btn-small { padding: var(--s1) var(--s3); font-size: 0.875rem; }
+#weights-edit[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
+.weights input[type="range"] { width: 100%; min-height: 44px; margin: 0; accent-color: var(--accent); background: transparent; cursor: pointer; }
+.weights input[type="range"]:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.weights li.is-edit { padding: 0; }
+.weights-reset { margin-top: var(--s3); }
+
+.tips-box { padding: var(--s4) var(--s4) var(--s3); }
+.tips-box h3 { font-size: 1.05rem; margin: 0 0 var(--s2); }
+.tips { list-style: none; padding: 0; margin: var(--s3) 0 0; }
+.tip {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "move try" "who try";
+  column-gap: var(--s3); row-gap: var(--s1); align-items: center; padding: var(--s3) 0; border-top: 1px dotted var(--line);
+}
+.tip-move { grid-area: move; margin: 0; font-size: 0.9375rem; }
+.tip-move strong { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.tip-factor { font-weight: 650; }
+.tip-who { grid-area: who; margin: 0; font-size: 0.875rem; color: var(--muted); }
+.tip-who a { font-weight: 650; }
+.tip-try { grid-area: try; }
+.tip.is-nearest .tip-move strong { color: var(--accent-text); }
+.tip-none { padding: var(--s3) 0; border-top: 1px dotted var(--line); font-size: 0.875rem; color: var(--muted); }
+#tips-status { margin-top: var(--s2); }
+#tips-status:empty { display: none; }
+
 /* gauge bar: width is set once from data, never animated */
 .bar {
   position: relative; display: inline-block; width: 5rem; height: 0.5rem; vertical-align: middle;
@@ -705,6 +734,6 @@ body.has-tray { padding-bottom: 7rem; }
 @media print {
   .sections, .toolbar, .skip, #suggest, .presets, .share-row, .cards-more, .compare-tray, .h2h-actions, .h2h-remove { display: none; }
   .cards .card[hidden] { display: flex !important; }
-  .card-actions, .chat-settings, .chat-form, #side-form { display: none; }
+  .card-actions, .chat-settings, .chat-form, #side-form, .tip-try, #weights-edit, .weights-reset { display: none; }
   .panel, .card, .top-pick, .table-wrap { box-shadow: none; }
 }
