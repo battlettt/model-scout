@@ -844,6 +844,72 @@ test("the monthly limit travels in the link as cap, in the memo, as a lever, and
   assert.ok(/Monthly spend limit: \$400 at this volume/.test(memo), memo.slice(0, 600));
 });
 
+section("Zero data retention");
+var zdrList = [
+  { model_id: "acme/a", provider_name: "Beta", pricing: { prompt: "0.000002", completion: "0.000008", input_cache_read: "0.0000005" } },
+  { model_id: "acme/a", provider_name: "Alpha", pricing: { prompt: "0.0000015", completion: "0.00001" } },
+  { model_id: "acme/a", provider_name: "Beta", pricing: { prompt: "0.000003", completion: "0.000009" } },
+  { model_id: "acme/a", provider_name: "Broken", pricing: { prompt: "-1", completion: "0.000001" } },
+  { model_id: "acme/a-pro", provider_name: "Gamma", pricing: { prompt: "0.0000001", completion: "0.0000001" } }
+];
+test("zdrFacts counts the exact id's endpoints and takes prices from the cheapest for a 3:1 mix", function () {
+  var z = S.zdrFacts("acme/a", zdrList);
+  assert.strictEqual(z.endpoints, 3); assert.deepStrictEqual(z.providers, ["Alpha", "Beta"]);
+  assert.strictEqual(z.cheapest, "Beta"); // 3 x 2 + 8 = 14 beats Alpha's 3 x 1.5 + 10 = 14.5
+  assert.strictEqual(z.input_price_per_mtok, 2); assert.strictEqual(z.output_price_per_mtok, 8); assert.strictEqual(z.cache_read_price_per_mtok, 0.5);
+  var none = S.zdrFacts("acme/b", zdrList);
+  assert.strictEqual(none.endpoints, 0); assert.strictEqual(none.cheapest, null); assert.deepStrictEqual(S.validateEntry(mk({ zdr: none })), []);
+  assert.deepStrictEqual(S.validateEntry(mk({ zdr: z })), []);
+  assert.ok(S.validateEntry(mk({ zdr: { endpoints: 2, providers: [] } })).length > 0, "endpoints without prices");
+  assert.ok(S.validateEntry(mk({ zdr: { endpoints: 1.5, providers: [] } })).length > 0, "fractional count");
+  assert.ok(S.validateEntry(mk({ zdr: [] })).length > 0, "a list is not zdr data");
+});
+test("requiring ZDR raises a price to the cheapest ZDR endpoint but never lowers it, and sets batch aside", function () {
+  var z = { endpoints: 2, providers: ["X"], cheapest: "X", input_price_per_mtok: 2, output_price_per_mtok: 3, cache_read_price_per_mtok: 0.2 };
+  var m = mk({ zdr: z, cache_read_price_per_mtok: 0.1, batch_input_price_per_mtok: 0.5, batch_output_price_per_mtok: 2 }); // listed $1 / $4
+  var e = S.effectivePrices(m, { zdr: true });
+  assert.deepStrictEqual([e.input, e.output, e.zdr, e.zdrRaised], [2, 4, true, true]);
+  assert.strictEqual(S.effectivePrices(m, { zdr: true, useBatch: true }).batch, false);
+  var c = S.effectivePrices(m, { zdr: true, cacheShare: 0.5 });
+  close(c.input, 0.5 * 2 + 0.5 * 0.2, "cache read uses the higher of the two cache prices");
+  var plain = S.effectivePrices(m, {});
+  assert.ok(!plain.zdr && plain.input === 1, "no requirement, no change");
+  assert.ok(!S.effectivePrices(m, { zdr: true, localOnly: true }).zdr, "local only ignores ZDR");
+  var cheaper = S.effectivePrices(mk({ zdr: Object.assign({}, z, { input_price_per_mtok: 0.5, output_price_per_mtok: 1 }) }), { zdr: true });
+  assert.deepStrictEqual([cheaper.input, cheaper.output, cheaper.zdrRaised], [1, 4, false]);
+});
+test("a ZDR requirement excludes models with no ZDR endpoint, flags unknown ones, and explains the price", function () {
+  var z = { endpoints: 1, providers: ["X"], cheapest: "X", input_price_per_mtok: 3, output_price_per_mtok: 4, cache_read_price_per_mtok: null };
+  var res = S.rankModels([mk({ id: "none", zdr: { endpoints: 0, providers: [] } }), mk({ id: "unknown" }), mk({ id: "yes", zdr: z })], profile({ zdr: true }), NOW);
+  assert.deepStrictEqual(res.excluded.map(function (r) { return r.model.id; }), ["none"]);
+  assert.ok(/No zero-data-retention endpoint/.test(res.excluded[0].excludeReason));
+  var byId = {}; res.ranked.forEach(function (r) { byId[r.model.id] = r; });
+  assert.ok(byId.unknown.flags.some(function (f) { return /Zero data retention not confirmed/.test(f); }));
+  assert.ok(byId.yes.notes.some(function (n) { return /cheapest ZDR endpoint \(X\) lists \$3\.00 in/.test(n); }), byId.yes.notes.join(" | "));
+  assert.strictEqual(S.rankModels([mk({ id: "none", zdr: { endpoints: 0, providers: [] }, open_weights: true, local_hardware: "laptop" })], profile({ zdr: true, localOnly: true }), NOW).ranked.length, 1);
+});
+test("ZDR travels in the link, the memo, the levers, and the description hints", function () {
+  assert.strictEqual(S.encodeSettings({ zdr: true }), "zdr=1");
+  assert.strictEqual(S.decodeSettings("?zdr=1").settings.zdr, true);
+  assert.strictEqual(S.profileFromSettings({ zdr: true }).zdr, true);
+  var ids = S.leverOptions(S.presetSettings("support")).map(function (o) { return o.id; });
+  assert.ok(ids.indexOf("zdr") >= 0 && ids.indexOf("drop-zdr") < 0, ids.join(","));
+  var on = S.leverOptions(Object.assign(S.presetSettings("support"), { zdr: true })).map(function (o) { return o.id; });
+  assert.ok(on.indexOf("drop-zdr") >= 0 && on.indexOf("zdr") < 0, on.join(","));
+  assert.ok(S.leverOptions(S.presetSettings("private")).every(function (o) { return !/zdr/.test(o.id); }), "no ZDR lever when local only");
+  var sg = S.suggestFromText("Summaries of patient notes, zero data retention required").settings;
+  assert.ok(sg.zdr === true && !sg.localOnly, JSON.stringify(sg));
+  var p = S.profileFromSettings({ zdr: true });
+  assert.ok(/Privacy: hosted, zero-data-retention endpoints only/.test(S.decisionMemo({ res: S.rankModels(models, p, NOW), p: p, now: NOW })));
+  assert.ok(/^Zero data retention: 3 endpoints \(Alpha, Beta\), cheapest Beta at \$2\.00 \/ \$8\.00 per 1M\.$/.test(S.zdrText({ zdr: S.zdrFacts("acme/a", zdrList) })));
+  assert.strictEqual(S.zdrText({ zdr: { endpoints: 0, providers: [] } }), "Zero data retention: no endpoint in OpenRouter's list.");
+  assert.strictEqual(S.zdrText({}), "");
+});
+test("every catalog model listed on OpenRouter has ZDR data from a dated snapshot", function () {
+  assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(catalog.zdr_snapshot || ""), "zdr_snapshot missing");
+  models.filter(function (m) { return m.openrouter_id; }).forEach(function (m) { assert.ok(m.zdr && S.validateEntry(m).length === 0, m.id + " has no zdr data"); });
+});
+
 section("Split traffic with a cheaper model");
 test("route options are the ranked models cheaper than the top pick, in rank order", function () {
   var top = mk({ id: "top", quality_tier: 5 }), mid = mk({ id: "mid", quality_tier: 4, input_price_per_mtok: 0.5, output_price_per_mtok: 2 });
@@ -1000,6 +1066,16 @@ test("refresh syncs input types from OpenRouter and keeps the reviewed ones when
   assert.deepStrictEqual(r.catalog.models[1].input_modalities, ["image", "text"]);
   assert.ok(r.changes.some(function (c) { return /^a: .*input_modalities/.test(c); }), r.changes.join(" | "));
   assert.ok(!r.changes.some(function (c) { return /^b: .*input_modalities/.test(c); }));
+});
+test("refresh with a ZDR list records each model's endpoints and the snapshot date; without one it leaves them", function () {
+  var cat = { catalog_date: "2026-01-01", stale_after_days: 90, notes: [], models: [mk({ id: "a", openrouter_id: "acme/a" }), mk({ id: "b", openrouter_id: "acme/b" })] };
+  var live = [{ id: "acme/a", pricing: { prompt: "0.000001", completion: "0.000004" } }];
+  var r = refreshTool.refresh(cat, live, "2026-11-14", zdrList);
+  assert.strictEqual(r.catalog.zdr_snapshot, "2026-11-14");
+  assert.strictEqual(r.catalog.models[0].zdr.endpoints, 3); assert.strictEqual(r.catalog.models[1].zdr.endpoints, 0, "listed nowhere means 0, not unknown");
+  assert.ok(r.changes.some(function (c) { return /^a: zdr none -> 3 endpoints, cheapest Beta/.test(c); }), r.changes.join(" | "));
+  var again = refreshTool.refresh(r.catalog, live, "2026-11-15");
+  assert.strictEqual(again.catalog.models[0].zdr.endpoints, 3); assert.strictEqual(again.catalog.zdr_snapshot, "2026-11-14");
 });
 test("no catalog entry is stale or dated after the catalog itself", function () {
   var at = new Date(catalog.catalog_date + "T12:00:00Z");

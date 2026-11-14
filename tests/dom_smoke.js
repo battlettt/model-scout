@@ -627,6 +627,21 @@ test("monthly limit: a link with cap leaves out pricier models, offers to lift i
   });
 });
 
+test("zero data retention: the checkbox drops models with no ZDR endpoint, reprices the rest, and goes in the link", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&speed=fast&budget=1&in=300&out=30&cache=50" });
+  function top() { return p.d.querySelector("#top-pick h3").firstChild.textContent.trim(); }
+  return settled(p).then(function () {
+    ok(/^\d{4}-\d{2}-\d{2}$/.test(p.$("zdr-date").textContent), "snapshot date: " + p.$("zdr-date").textContent);
+    ok(top() === "DeepSeek V4.1 Flash", "top before: " + top());
+    ok(/Zero data retention: \d+ endpoints/.test(p.$("cards").textContent), "card line missing");
+    p.$("need-zdr").checked = true; fire(p, "need-zdr", "change");
+    ok(top() !== "DeepSeek V4.1 Flash", "DeepSeek should drop once its higher ZDR price applies");
+    ok(/Claude Fable 5\.\d[\s\S]*No zero-data-retention endpoint/.test(p.$("excluded").textContent), "excluded: " + p.$("excluded").textContent.slice(0, 300));
+    ok(/(^|&|\?)zdr=1(&|$)/.test(p.w.location.search), "address: " + p.w.location.search);
+    ok(Array.prototype.some.call(p.d.querySelectorAll("#whatif .wi"), function (li) { return /Drop the zero-data-retention requirement/.test(li.textContent); }), "drop lever missing");
+  });
+});
+
 test("split traffic: pick a cheaper model and a share, see the cost, and the memo carries it", function () {
   var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
   var copied = null;
