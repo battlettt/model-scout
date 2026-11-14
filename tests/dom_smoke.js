@@ -664,6 +664,29 @@ test("backup host: a link with backup=1 checks the box, leaves out one-host mode
   });
 });
 
+test("use the pick in code: curl by default with fallbacks, switches language, drops fallbacks, copies, and is withheld for local only", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3&json=1" });
+  var copied = null;
+  Object.defineProperty(p.w.navigator, "clipboard", { value: { writeText: function (t) { copied = t; return Promise.resolve(); } }, configurable: true });
+  function code() { return p.$("snippet-code").textContent; }
+  return settled(p).then(function () {
+    ok(/^curl https:\/\/openrouter\.ai\/api\/v1\/chat\/completions/.test(code()) && /"models": \[\s+"x-ai\/grok-4\.7",/.test(code()), "curl: " + code().slice(0, 300));
+    ok(/"response_format"/.test(code()) && !/"provider"/.test(code()), "JSON on, ZDR off");
+    ok(/^Tries Grok 4\.7 first, then /.test(p.$("snippet-notes").textContent), "notes: " + p.$("snippet-notes").textContent.slice(0, 200));
+    p.$("snippet-lang-python").checked = true; fire(p, "snippet-lang-python", "change");
+    ok(/^import json, os, urllib\.request/.test(code()) && /os\.environ\["OPENROUTER_API_KEY"\]/.test(code()), "python: " + code().slice(0, 120));
+    p.$("snippet-fallback").checked = false; fire(p, "snippet-fallback", "change");
+    ok(/"model": "x-ai\/grok-4\.7"/.test(code()) && !/"models"/.test(code()), "one model without fallbacks");
+    ok(/^Calls Grok 4\.7 only/.test(p.$("snippet-notes").textContent), "single note");
+    p.$("snippet-copy").click();
+    return waitFor(function () { return copied; }, "clipboard write");
+  }).then(function () {
+    ok(copied === code() && /Copied the Python request/.test(p.$("snippet-status").textContent), "status: " + p.$("snippet-status").textContent);
+    p.$("local-only").checked = true; fire(p, "local-only", "change");
+    ok(/^Local only: /.test(code()) && p.$("snippet-copy").disabled && p.$("snippet-notes").textContent === "", "local: " + code());
+  });
+});
+
 test("test kit: lists the shortlist plus the split pick, downloads a script, and is withheld for local only", function () {
   var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
   var saved = null;

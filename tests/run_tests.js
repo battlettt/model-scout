@@ -1048,6 +1048,69 @@ test("the script reads the key from the environment, escapes names, and keeps th
   }
 });
 
+section("Use the pick in code");
+function snipRes(list, p) { return S.rankModels(list, p || profile(), NOW); }
+var snipList = [
+  mk({ id: "top", openrouter_id: "acme/top", input_price_per_mtok: 0.1, output_price_per_mtok: 0.2 }),
+  mk({ id: "selfonly", openrouter_id: null, open_weights: false, input_price_per_mtok: 0.2, output_price_per_mtok: 0.3 }),
+  mk({ id: "second", openrouter_id: "acme/second", input_price_per_mtok: 0.3, output_price_per_mtok: 0.4 }),
+  mk({ id: "third", openrouter_id: "acme/third", input_price_per_mtok: 0.5, output_price_per_mtok: 0.6 }),
+  mk({ id: "fourth", openrouter_id: "acme/fourth", input_price_per_mtok: 0.7, output_price_per_mtok: 0.8 })
+];
+test("snippet models: the top pick, then up to two more OpenRouter-listed picks in rank order", function () {
+  var res = snipRes(snipList), p = profile();
+  assert.deepStrictEqual(res.ranked.map(function (r) { return r.model.id; }), ["top", "selfonly", "second", "third", "fourth"], "cost decides the order");
+  assert.deepStrictEqual(S.snippetModels(res, p, true).map(function (m) { return m.openrouter_id; }), ["acme/top", "acme/second", "acme/third"]);
+  assert.deepStrictEqual(S.snippetModels(res, p, false).map(function (m) { return m.id; }), ["top"]);
+  assert.deepStrictEqual(S.snippetModels(snipRes(snipList.slice(1)), p, true), [], "a top pick OpenRouter does not list gets no request");
+  var lp = profile({ localOnly: true });
+  assert.deepStrictEqual(S.snippetModels(snipRes([mk({ id: "o", openrouter_id: "acme/o", open_weights: true, local_hardware: "laptop" })], lp), lp, true), []);
+  var ep = profile({ taskType: "embeddings" });
+  assert.deepStrictEqual(S.snippetModels(snipRes([mk({ id: "e", kind: "embedding", openrouter_id: "acme/e" })], ep), ep, true), []);
+  assert.deepStrictEqual(S.snippetModels({ ranked: [] }, p, true), []);
+});
+test("snippet body: a models list for fallbacks, one model without, and the profile's JSON and ZDR needs", function () {
+  var two = [{ openrouter_id: "acme/a" }, { openrouter_id: "acme/b" }];
+  assert.deepStrictEqual(S.snippetBody(two, profile()), { models: ["acme/a", "acme/b"], messages: [{ role: "user", content: "Replace with your prompt." }] });
+  assert.deepStrictEqual(S.snippetBody([two[0]], profile({ needs: { json: true }, zdr: true })), {
+    model: "acme/a", messages: [{ role: "user", content: "Replace with your prompt, and ask for the answer as JSON." }],
+    response_format: { type: "json_object" }, provider: { zdr: true } });
+  assert.ok(!S.snippetBody(two, profile({ zdr: true, localOnly: true })).provider, "no ZDR routing when local only");
+});
+test("each language sends the same body, reads the key from the environment, and parses", function () {
+  var models = [{ openrouter_id: "acme/a", name: "A" }, { openrouter_id: "acme/it's", name: "B" }], p = profile({ needs: { json: true }, zdr: true });
+  var body = S.snippetBody(models, p);
+  Object.keys(S.SNIPPET_LANGS).forEach(function (l) {
+    var code = S.codeSnippet(l, models, p);
+    assert.ok(code.indexOf("https://openrouter.ai/api/v1/chat/completions") >= 0 && /OPENROUTER_API_KEY/.test(code), l);
+    assert.ok(!/sk-or|—/.test(code), l + " holds no key and no em dash");
+  });
+  var curl = S.codeSnippet("curl", models, p), quoted = curl.slice(curl.indexOf("-d '") + 4, curl.lastIndexOf("'"));
+  assert.deepStrictEqual(JSON.parse(quoted.split("'\\''").join("'")), body, "curl body, with the single quote escaped for the shell");
+  var js = S.codeSnippet("javascript", models, p), AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  assert.doesNotThrow(function () { new AsyncFunction("process", "fetch", "console", js); }, "the JavaScript parses");
+  assert.strictEqual(S.codeSnippet("curl", [], p), "");
+  var cp = require("child_process"), os = require("os");
+  if (cp.spawnSync("python3", ["--version"]).status !== 0) return;
+  var py = S.codeSnippet("python", models, p), f = path.join(os.tmpdir(), "model_scout_snippet_" + process.pid + ".py");
+  fs.writeFileSync(f, py.split("\nreq = ")[0] + "\nimport json as _j\nprint(_j.dumps(body))\n");
+  var r = cp.spawnSync("python3", ["-I", f], { encoding: "utf8" });
+  try { fs.unlinkSync(f); } catch (e) { /* already gone */ }
+  assert.strictEqual(r.status, 0, String(r.stderr));
+  assert.deepStrictEqual(JSON.parse(r.stdout), body, "the Python literal is the same body");
+});
+test("snippet notes say what the request does and what it leaves to you", function () {
+  var three = [{ name: "A" }, { name: "B" }, { name: "C" }];
+  var n = S.snippetNotes(three, profile({ zdr: true, needs: { json: true, tools: true }, useBatch: true, cacheShare: 0.5 }));
+  assert.ok(/^Tries A first, then B, then C if a model errors/.test(n[0]) && /billed at the model that answered/.test(n[0]), n[0]);
+  ["provider\\.zdr", "response_format", "tool definitions", "standard prices", "cache_control", "OPENROUTER_API_KEY"].forEach(function (k) {
+    assert.ok(n.some(function (t) { return new RegExp(k).test(t); }), "missing note: " + k);
+  });
+  var one = S.snippetNotes([{ name: "A" }], profile());
+  assert.deepStrictEqual(one, ["Calls A only, with no other model to fall back to.", "Reads the key from the OPENROUTER_API_KEY environment variable. Nothing here holds a key."]);
+  assert.deepStrictEqual(S.snippetNotes([], profile()), []);
+});
+
 section("Exclusion summary and CSV export");
 test("the exclusion summary counts reasons, most common first", function () {
   var res = S.rankModels([mk({ id: "e", kind: "embedding" }), mk({ id: "a", input_price_per_mtok: 9 }), mk({ id: "b", input_price_per_mtok: 8 }), mk({ id: "ok", input_price_per_mtok: 0.1, output_price_per_mtok: 0.1 })],
@@ -1997,6 +2060,22 @@ atest("a render error in one column does not stop the other", function () {
   return S.runCompare(f, sideCols(DUMMY_KEY), function (i, st) { if (i === 0) throw new Error("render broke"); rendered.push(st.status); }).then(function (res) {
     assert.deepStrictEqual(res.map(function (c) { return c.status; }), ["done", "done"]);
     assert.deepStrictEqual(rendered, ["sending", "done"]);
+  });
+});
+
+asection("Use the pick in code: running the JavaScript (stubbed fetch)");
+atest("the JavaScript request sends the body with the key from the environment and logs the answer", function () {
+  var models = [{ openrouter_id: "acme/a", name: "A" }, { openrouter_id: "acme/b", name: "B" }], p = profile({ needs: { json: true }, zdr: true });
+  var js = S.codeSnippet("javascript", models, p), AsyncFunction = Object.getPrototypeOf(async function () {}).constructor, sent = null, logged = [];
+  function fakeFetch(url, init) {
+    sent = { url: url, init: init };
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ model: "acme/b", choices: [{ message: { content: "hi" } }] }); } });
+  }
+  return new AsyncFunction("process", "fetch", "console", js)({ env: { OPENROUTER_API_KEY: "local-test" } }, fakeFetch, { log: function (x) { logged.push(x); } }).then(function () {
+    assert.strictEqual(sent.url, "https://openrouter.ai/api/v1/chat/completions");
+    assert.strictEqual(sent.init.headers.Authorization, "Bearer local-test");
+    assert.deepStrictEqual(JSON.parse(sent.init.body), S.snippetBody(models, p));
+    assert.deepStrictEqual(logged, ["acme/b", "hi"]);
   });
 });
 
