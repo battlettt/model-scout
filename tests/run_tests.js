@@ -1328,7 +1328,16 @@ test("every asset reference in index.html is relative", function () {
     assert.ok(r[0] !== "/", "absolute path: " + r);
     assert.ok(!/^[a-z]+:/i.test(r), "external or scheme URL: " + r);
   });
-  ["styles.css", "app.js"].forEach(function (a) { assert.ok(refs.indexOf(a) >= 0, a + " not referenced"); });
+  ["styles.css", "app.js"].forEach(function (a) { assert.ok(refs.some(function (r) { return r.split("?")[0] === a; }), a + " not referenced"); });
+});
+test("index.html loads app.js and styles.css stamped with their current content hash (run tests/sync_embedded_catalog.js)", function () {
+  var syncTool = require("./sync_embedded_catalog.js"), v = syncTool.assetVersion();
+  assert.ok(/^[0-9a-f]{10}$/.test(v));
+  assert.ok(html.indexOf('<link rel="stylesheet" href="styles.css?v=' + v + '">') >= 0, "styles.css is not stamped v=" + v);
+  assert.ok(html.indexOf('<script src="app.js?v=' + v + '"></script>') >= 0, "app.js is not stamped v=" + v);
+  var again = syncTool.stampAssets('<link rel="stylesheet" href="styles.css?v=0000000000">\n<script src="app.js"></script>', "abcdef0123");
+  assert.strictEqual(again, '<link rel="stylesheet" href="styles.css?v=abcdef0123">\n<script src="app.js?v=abcdef0123"></script>');
+  assert.throws(function () { syncTool.stampAssets("<p>no assets</p>", v); });
 });
 test("app.js calls only relative catalog.json, openrouter.ai, and the local Ollama chat URL", function () {
   var js = fs.readFileSync(path.join(ROOT, "app.js"), "utf8");

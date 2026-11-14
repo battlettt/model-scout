@@ -34,7 +34,7 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - `index.html`, `styles.css`, `app.js`, `catalog.json` at the repo root are the whole app (deploy these four; the favicon is an inline SVG).
 - `app.js`: pure engine (weights, scoring, cost, staleness, validation, live merge, switch check, robustness, settings links, presets) exported for node, then browser UI.
 - `tools/refresh_catalog.js`: refreshes catalog.json from a saved OpenRouter model list (prices, context, capabilities, input types, cache and batch prices, output limits, dates) and re-embeds it. Never touches editorial fields. Not deployed.
-- `index.html` embeds a copy of `catalog.json` for `file://` use. After editing the catalog run `node tests/sync_embedded_catalog.js`; a test fails if they drift.
+- `index.html` embeds a copy of `catalog.json` for `file://` use. After editing the catalog, `app.js` or `styles.css` run `node tests/sync_embedded_catalog.js`: it re-embeds the catalog and stamps `app.js?v=` / `styles.css?v=` with a content hash so a deploy never mixes cached old files with the new page; a test fails if either drifts.
 - `AGENTS.md` is a symlink to this file (git mode 120000). Do not replace it with a regular file.
 
 ## Chat rules
