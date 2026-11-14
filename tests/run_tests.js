@@ -763,6 +763,65 @@ test("the memo names the tipping point and says when weights were set by hand", 
   assert.ok(/- Weights: from the profile/.test(md2) && !/Tipping point/.test(md2));
 });
 
+section("Market watch");
+function daysBefore(n) { return new Date(NOW.getTime() - n * 864e5).toISOString().slice(0, 10); }
+test("mergeLive keeps the snapshot price so a price move can be shown", function () {
+  var base = [mk({ id: "known", openrouter_id: "x/known", input_price_per_mtok: 1, output_price_per_mtok: 8, context_window: 400000, last_verified: "2026-10-30" })];
+  var b = S.mergeLive(base, orSample, NOW).models[0].live.before;
+  assert.deepStrictEqual(b, { input: 1, output: 8, context: 400000, date: "2026-10-30" });
+});
+test("pctChange gives a signed percentage, or null without a usable start", function () {
+  assert.strictEqual(S.pctChange(2, 1), -50);
+  assert.strictEqual(S.pctChange(1, 1.25), 25);
+  assert.strictEqual(S.pctChange(0, 1), null);
+  assert.strictEqual(S.pctChange(null, 1), null);
+});
+test("new models: listed within the window, newest first, reviewed before unreviewed on the same day", function () {
+  var entries = [
+    mk({ id: "old", model: "Old", listed_on: daysBefore(45) }),
+    mk({ id: "a", model: "A", listed_on: daysBefore(3), liveOnly: true }),
+    mk({ id: "b", model: "B", listed_on: daysBefore(3) }),
+    mk({ id: "c", model: "C", listed_on: daysBefore(0) }),
+    mk({ id: "future", model: "Future", listed_on: daysBefore(-5) }),
+    mk({ id: "none", model: "None" })
+  ];
+  var mw = S.marketWatch(entries, NOW);
+  assert.strictEqual(mw.days, 30);
+  assert.deepStrictEqual(mw.fresh.map(function (x) { return x.model.id; }), ["c", "b", "a"]);
+  assert.deepStrictEqual(mw.fresh.map(function (x) { return x.days; }), [0, 3, 3]);
+  assert.strictEqual(mw.fresh[2].reviewed, false);
+  assert.strictEqual(S.marketWatch(entries, NOW, { days: 60 }).fresh.length, 4);
+});
+test("price moves: only reviewed models whose live price differs, biggest change first", function () {
+  function moved(id, bi, bo, i, o, extra) {
+    var m = mk(Object.assign({ id: id, model: id, input_price_per_mtok: i, output_price_per_mtok: o }, extra || {}));
+    m.live = { fetchedAt: NOW.toISOString(), changes: [], before: { input: bi, output: bo, context: 1000000, date: "2026-10-01" } };
+    return m;
+  }
+  var mw = S.marketWatch([moved("small", 1, 4, 0.9, 4), moved("big", 2, 8, 1, 4), moved("same", 1, 4, 1, 4), moved("liveonly", 1, 4, 3, 9, { liveOnly: true })], NOW);
+  assert.deepStrictEqual(mw.moves.map(function (x) { return x.model.id; }), ["big", "small"]);
+  assert.strictEqual(mw.moves[0].input.pct, -50);
+  assert.strictEqual(mw.moves[0].output.pct, -50);
+  assert.strictEqual(mw.moves[1].output.pct, 0);
+  assert.strictEqual(mw.moves[0].since, "2026-10-01");
+});
+test("retiring: every listed retirement date, past ones flagged, soonest first", function () {
+  var mw = S.marketWatch([
+    mk({ id: "later", model: "Later", retires_on: daysBefore(-40) }),
+    mk({ id: "gone", model: "Gone", retires_on: daysBefore(2) }),
+    mk({ id: "soon", model: "Soon", retires_on: daysBefore(-1), liveOnly: true }),
+    mk({ id: "never", model: "Never" })
+  ], NOW);
+  assert.deepStrictEqual(mw.retiring.map(function (x) { return x.model.id; }), ["gone", "soon", "later"]);
+  assert.ok(mw.retiring[0].past && !mw.retiring[1].past);
+  assert.strictEqual(mw.retiring[1].reviewed, false);
+  assert.strictEqual(mw.retiring[2].on, daysBefore(-40));
+});
+test("an empty or missing list gives empty answers, not an error", function () {
+  var mw = S.marketWatch(null, NOW);
+  assert.deepStrictEqual([mw.fresh.length, mw.moves.length, mw.retiring.length], [0, 0, 0]);
+});
+
 section("Catalog refresh tool");
 var refreshTool = require("../tools/refresh_catalog.js");
 test("refresh updates listed figures and leaves editorial fields alone", function () {

@@ -557,6 +557,39 @@ test("tipping points and hand-set weights: try a tip, drag a slider, go back to 
   });
 });
 
+test("market watch: new models, price moves, and retirements from the live list, checked against the profile", function () {
+  var sample = orSample(), first = CATALOG.models.filter(function (m) { return m.openrouter_id; })[0];
+  sample.data[1].created = Math.floor(Date.now() / 1000) - 3 * 86400;
+  sample.data[1].expiration_date = new Date(Date.now() + 10 * 864e5).toISOString().slice(0, 10);
+  var p = boot({ openrouter: function () { return resp(sample); } });
+  return settled(p).then(function () {
+    ok(/From OpenRouter's public model list, fetched/.test(p.$("market-source").textContent), "source: " + p.$("market-source").textContent);
+    var fresh = p.$("mw-fresh").textContent;
+    ok(/Live Only One/.test(fresh) && /Listed 3 days ago/.test(fresh), "new list: " + fresh.slice(0, 200));
+    ok(/Fits your hard limits|Ruled out for you/.test(fresh), "fresh row should be checked against the profile");
+    ok(!p.$("mw-fresh-note").hidden && /^1 of these is not reviewed/.test(p.$("mw-fresh-note-text").textContent), "note: " + p.$("mw-fresh-note-text").textContent);
+    var moves = p.$("mw-moves").textContent;
+    ok(moves.indexOf(first.model) >= 0 && /down (49\.\d|50)%/.test(moves) && /At your volume/.test(moves), "moves: " + moves.slice(0, 240));
+    ok(p.$("mw-moves-count").textContent === "1", "moves count: " + p.$("mw-moves-count").textContent);
+    var retire = p.$("mw-retire").textContent;
+    ok(/Live Only One/.test(retire) && /Retires in (9|10) days/.test(retire), "retiring: " + retire.slice(0, 200));
+    ok(!p.$("include-live").checked, "live models start out of the ranking");
+    p.$("mw-include").click();
+    ok(p.$("include-live").checked && /Rank reviewed models only/.test(p.$("mw-include").textContent), "include button should tick the live checkbox");
+    ok(/They are in the ranking now/.test(p.$("mw-fresh-note-text").textContent), "note should follow the checkbox");
+  });
+});
+
+test("market watch without live data: says so, and compares no prices", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    ok(/did not load/.test(p.$("market-source").textContent) && /bundled snapshot/.test(p.$("market-source").textContent), "source: " + p.$("market-source").textContent);
+    ok(/Needs the live list/.test(p.$("mw-moves").textContent), "moves: " + p.$("mw-moves").textContent);
+    ok(p.$("mw-fresh-note").hidden, "no unreviewed note without live data");
+    ok(p.d.querySelectorAll('.sections a').length === 7 && p.d.querySelector('.sections a[href="#market"]'), "nav should list the market watch");
+  });
+});
+
 (function run(i) {
   if (i >= cases.length) {
     console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");

@@ -36,6 +36,7 @@
   var MAX_CACHE_SHARE = 0.95;
   var ROBUST_SAMPLES = 300;
   var ROBUST_SPREAD = Math.log(2); // each weight is scaled by a factor between 1/2 and 2
+  var NEW_WINDOW_DAYS = 30; // "new" in the market watch means first listed within this many days
   var TIP_EDGE = 0.0005; // tipping points within 0.05 points of 0% or 100% are ties at the edge, not reported
   var DAYS_PER_MONTH = 365 / 12;
 
@@ -853,7 +854,8 @@
       Object.keys(facts).forEach(function (k) { copy[k] = facts[k]; });
       copy.price_status = "live";
       copy.last_verified = stamp;
-      copy.live = { fetchedAt: stamp, changes: diffs };
+      copy.live = { fetchedAt: stamp, changes: diffs,
+        before: { input: e.input_price_per_mtok, output: e.output_price_per_mtok, context: e.context_window, date: String(e.last_verified || "").slice(0, 10) } };
       if (diffs.length) changed.push({ model: e.model, changes: diffs });
       return copy;
     });
@@ -885,6 +887,49 @@
       liveOnly.push(entry);
     });
     return { models: merged, matched: matched, changed: changed, liveOnly: liveOnly };
+  }
+
+  // ---------- market watch ----------
+  /** Percent change from a to b, or null when either is missing or a is zero. */
+  function pctChange(a, b) { return isNum(a) && isNum(b) && a > 0 ? round((b - a) / a * 100, 1) : null; }
+
+  /**
+   * What changed on the market. entries: reviewed catalog entries (merged with live data when it loaded)
+   * plus live-only entries. Returns:
+   *   fresh: entries first listed on OpenRouter within the last `days` days (default 30), newest first;
+   *   moves: reviewed entries whose live input or output price differs from the bundled snapshot, biggest change first;
+   *   retiring: entries with a retirement date (past ones too, while still listed), soonest first.
+   */
+  function marketWatch(entries, now, opts) {
+    opts = opts || {};
+    var windowDays = isNum(opts.days) ? opts.days : NEW_WINDOW_DAYS;
+    var nowMs = now instanceof Date ? now.getTime() : (isNum(now) ? now : Date.now());
+    var fresh = [], moves = [], retiring = [];
+    (entries || []).forEach(function (m) {
+      if (!m) return;
+      var listed = parseDate(m.listed_on);
+      if (listed !== null) {
+        var age = Math.floor((nowMs - listed) / DAY_MS);
+        if (age >= 0 && age <= windowDays) fresh.push({ model: m, days: age, reviewed: !m.liveOnly });
+      }
+      var b = m.live && m.live.before;
+      if (b && !m.liveOnly) {
+        var ci = pctChange(b.input, m.input_price_per_mtok), co = pctChange(b.output, m.output_price_per_mtok);
+        if ((isNum(b.input) && b.input !== m.input_price_per_mtok) || (isNum(b.output) && b.output !== m.output_price_per_mtok)) {
+          moves.push({ model: m, since: b.date || null,
+            input: { from: b.input, to: m.input_price_per_mtok, pct: ci },
+            output: { from: b.output, to: m.output_price_per_mtok, pct: co } });
+        }
+      }
+      var ret = retirement(m, nowMs);
+      if (ret) retiring.push({ model: m, days: ret.days, past: ret.past, on: String(m.retires_on).slice(0, 10), reviewed: !m.liveOnly });
+    });
+    function name(a, b) { return String(a.model.model).localeCompare(String(b.model.model)); }
+    function size(x) { return Math.max(Math.abs(x.input.pct || 0), Math.abs(x.output.pct || 0)); }
+    fresh.sort(function (a, b) { return a.days - b.days || (b.reviewed - a.reviewed) || name(a, b); });
+    moves.sort(function (a, b) { return size(b) - size(a) || name(a, b); });
+    retiring.sort(function (a, b) { return a.days - b.days || (b.reviewed - a.reviewed) || name(a, b); });
+    return { days: windowDays, fresh: fresh, moves: moves, retiring: retiring };
   }
 
   // ---------- task description hints ----------
@@ -1336,6 +1381,7 @@
     frontier: frontier, cheaperAlternative: cheaperAlternative, valueMapSvg: valueMapSvg, headToHead: headToHead, decisionMemo: decisionMemo,
     FACTORS: FACTORS, normalizeWeights: normalizeWeights, weightsAt: weightsAt, sharesToPercents: sharesToPercents,
     tippingPoints: tippingPoints, tipWeights: tipWeights, tipSentence: tipSentence, shareLabel: shareLabel,
+    marketWatch: marketWatch, pctChange: pctChange,
     OPENROUTER_CHAT_URL: OPENROUTER_CHAT_URL, OLLAMA_CHAT_URL: OLLAMA_CHAT_URL, LOCAL_MODEL: LOCAL_MODEL,
     DEFAULT_CHAT_MODEL: DEFAULT_CHAT_MODEL, FEATURED_CHAT_MODELS: FEATURED_CHAT_MODELS, KEY_STORAGE: KEY_STORAGE,
     buildChatRequest: buildChatRequest, chatText: chatText, httpErrorText: httpErrorText, localModeCheck: localModeCheck,
@@ -1351,7 +1397,7 @@
   var CARD_LIMIT = 6;
   var state = { catalog: null, catalogOrigin: "", base: [], liveOnly: [], live: null, liveIds: null, now: new Date(), lastOrder: null,
     touched: false, showAllCards: false, linkNote: "", compare: [], lastRes: null, lastProfile: null,
-    customWeights: null, editWeights: false };
+    customWeights: null, editWeights: false, mwOpen: { fresh: false, retire: false } };
   var COMPARE_MAX = 3;
   var TIP_ROWS = 4;
 
@@ -1725,6 +1771,7 @@
     renderCompare(res, p);
     renderSwitchOptions();
     renderSwitch();
+    renderMarket(res, p);
     syncUrl();
   }
 
@@ -1995,6 +2042,109 @@
     }).join("");
     sel.dataset.n = String(list.length);
     sel.value = prev;
+  }
+
+  // ----- market watch -----
+  var MW_ROWS = 6;
+
+  function agoText(d) { return d === 0 ? "today" : d === 1 ? "yesterday" : d + " days ago"; }
+  function untilText(x) {
+    if (x.past) return "retired " + agoText(-x.days) + ", still listed";
+    return x.days === 0 ? "retires today" : x.days === 1 ? "retires tomorrow" : "retires in " + x.days + " days";
+  }
+  function rankIn(res, id) {
+    var hit = null;
+    (res && res.ranked || []).forEach(function (r) { if (r.model.id === id) hit = r; });
+    return hit;
+  }
+  /** A model's name, linked to its card when it is ranked, otherwise to its source page. */
+  function mwLink(m, res) {
+    if (rankIn(res, m.id)) return '<a href="#card-' + esc(m.id) + '">' + esc(m.model) + "</a>";
+    return '<a href="' + esc(safeUrl(m.source && m.source.url)) + '" rel="noopener">' + esc(m.model) + "</a>";
+  }
+  function mwBadge(m) { return m.liveOnly ? "" : '<span class="badge ok">Reviewed</span>'; }
+
+  /** Does a market entry pass the profile's hard limits, and what would it cost at this volume? */
+  function mwFit(m, res, p) {
+    var r = scoreModel(m, p, res.weights, state.now), top = res.ranked[0];
+    if (r.excluded) return '<p class="mw-fit is-out">Ruled out for you: ' + esc(r.excludeReason) + "</p>";
+    var bits = [], ranked = rankIn(res, m.id), mc = monthlyCost(m, p.inputTokens, p.outputTokens, p);
+    if (ranked) bits.push("Ranks #" + ranked.rank + " for you.");
+    if (!p.localOnly && mc !== null) {
+      bits.push("About " + fmtMoney(mc) + " a month at your volume" +
+        (top && top.model.id !== m.id ? " (your top pick: " + fmtMoney(monthlyCost(top.model, p.inputTokens, p.outputTokens, p)) + ")." : "."));
+    }
+    return '<p class="mw-fit is-in"><strong>Fits your hard limits.</strong> ' + esc(bits.join(" ")) + "</p>";
+  }
+
+  function mwList(id, rows, open, more, empty) {
+    $(id).innerHTML = rows.length ? rows.map(function (h, i) { return h.replace("<li", "<li" + (!open && i >= MW_ROWS ? " hidden" : "")); }).join("") :
+      '<li class="mw-empty">' + esc(empty) + "</li>";
+    var btn = $(more);
+    if (!btn) return;
+    btn.hidden = rows.length <= MW_ROWS;
+    btn.setAttribute("aria-expanded", String(!!open));
+    btn.textContent = open ? "Show fewer" : "Show all " + rows.length;
+  }
+
+  function renderMarket(res, p) {
+    var live = state.live && state.live.ok, catDate = state.catalog ? state.catalog.catalog_date : "unknown";
+    var entries = state.base.concat(live ? state.liveOnly : []);
+    var mw = marketWatch(entries, state.now), top = res.ranked[0];
+    var current = $("current-model") ? $("current-model").value : "";
+    $("mw-days").textContent = String(mw.days);
+    $("market-source").textContent = live ?
+      "From OpenRouter's public model list, fetched " + state.live.fetchedAt.toLocaleString() + ". Free, batch, and other variants are left out; new means first listed in the last " + mw.days + " days." :
+      state.live ? "OpenRouter's live list did not load (" + state.live.error + "), so this shows only what the bundled snapshot of " + catDate + " knows about the " + state.base.length + " reviewed models." :
+      "Checking OpenRouter's live list...";
+
+    $("mw-fresh-count").textContent = mw.fresh.length ? String(mw.fresh.length) : "";
+    var unreviewed = mw.fresh.filter(function (x) { return !x.reviewed; }).length, incl = $("include-live").checked;
+    $("mw-fresh-note").hidden = !unreviewed;
+    $("mw-fresh-note-text").textContent = unreviewed + " of these " + (unreviewed === 1 ? "is" : "are") + " not reviewed by Model Scout, so quality and speed are not rated. " +
+      (incl ? "They are in the ranking now, scored as average on both." : "They join the ranking, scored as average on both, when you include live models.");
+    $("mw-include").textContent = incl ? "Rank reviewed models only" : "Include live models in the ranking";
+    mwList("mw-fresh", mw.fresh.map(function (x) {
+      var m = x.model;
+      return '<li class="mw-row">' +
+        '<p class="mw-name">' + mwLink(m, res) + ' <span class="provider">' + esc(m.provider) + "</span> " + mwBadge(m) + "</p>" +
+        '<p class="mw-facts">Listed ' + esc(agoText(x.days)) + " (" + esc(m.listed_on) + "). " + fmtPrice(m.input_price_per_mtok) + " in / " +
+          fmtPrice(m.output_price_per_mtok) + " out per 1M. " + esc(fmtTokens(m.context_window)) + " context.</p>" +
+        mwFit(m, res, p) + "</li>";
+    }), state.mwOpen.fresh, "mw-fresh-more",
+      live ? "Nothing new on OpenRouter in the last " + mw.days + " days." : "No reviewed model was first listed in the last " + mw.days + " days. The live list would show the rest.");
+
+    $("mw-moves-count").textContent = mw.moves.length ? String(mw.moves.length) : "";
+    mwList("mw-moves", mw.moves.map(function (x) {
+      var m = x.model, b = m.live.before;
+      function side(label, d) {
+        if (d.from === d.to) return label + " unchanged at " + fmtPrice(d.to);
+        return label + " " + fmtPrice(d.from) + " to " + fmtPrice(d.to) + (d.pct === null ? "" : " (" + (d.pct < 0 ? "down " : "up ") + Math.abs(d.pct) + "%)");
+      }
+      var was = monthlyCost({ input_price_per_mtok: b.input, output_price_per_mtok: b.output }, p.inputTokens, p.outputTokens);
+      var now = monthlyCost(m, p.inputTokens, p.outputTokens);
+      var cls = (x.input.pct || 0) + (x.output.pct || 0) < 0 ? " is-down" : " is-up";
+      return '<li class="mw-row' + cls + '">' +
+        '<p class="mw-name">' + mwLink(m, res) + ' <span class="provider">' + esc(m.provider) + "</span></p>" +
+        '<p class="mw-facts">' + esc(side("Input", x.input) + "; " + side("output", x.output)) + " per 1M, since " + esc(x.since || catDate) + ".</p>" +
+        (was !== null && now !== null && !p.localOnly ? '<p class="mw-fit">At your volume, before cache and batch discounts: ' + esc(fmtMoney(was)) + " to " + esc(fmtMoney(now)) + " a month.</p>" : "") +
+        "</li>";
+    }), true, null,
+      live ? "No changes: every reviewed model OpenRouter lists costs the same as in the snapshot of " + catDate + "." :
+      "Needs the live list to compare prices with the snapshot of " + catDate + ".");
+
+    $("mw-retire-count").textContent = mw.retiring.length ? String(mw.retiring.length) : "";
+    mwList("mw-retire", mw.retiring.map(function (x) {
+      var m = x.model, tags = [];
+      if (top && top.model.id === m.id) tags.push('<span class="badge warn">Your top pick</span>');
+      if (current && current === m.id) tags.push('<span class="badge warn">The model you use today</span>');
+      var ranked = rankIn(res, m.id);
+      return '<li class="mw-row' + (tags.length ? " is-yours" : "") + (x.past ? " is-past" : "") + '">' +
+        '<p class="mw-name">' + mwLink(m, res) + ' <span class="provider">' + esc(m.provider) + "</span> " + mwBadge(m) + " " + tags.join(" ") + "</p>" +
+        '<p class="mw-facts"><strong>' + esc(untilText(x).charAt(0).toUpperCase() + untilText(x).slice(1)) + "</strong> (" + esc(x.on) + ")." +
+          (ranked ? " Ranks #" + ranked.rank + " for you." : "") + "</p></li>";
+    }), state.mwOpen.retire, "mw-retire-more",
+      live ? "No retirement dates announced for any listed model." : "No retirement dates in the bundled snapshot. The live list may know more.");
   }
 
   function renderSwitch() {
@@ -2453,7 +2603,10 @@
     form.addEventListener("submit", function (e) { e.preventDefault(); render(); });
     $("suggest").addEventListener("click", applySuggestions);
     $("include-live").addEventListener("change", render);
-    $("current-model").addEventListener("change", renderSwitch);
+    $("current-model").addEventListener("change", function () {
+      renderSwitch();
+      if (state.lastRes) renderMarket(state.lastRes, state.lastProfile);
+    });
     $("preset-list").addEventListener("click", function (e) {
       var b = e.target && e.target.closest ? e.target.closest(".preset") : null;
       if (b) usePreset(b.getAttribute("data-preset"));
@@ -2502,6 +2655,17 @@
       state.touched = true;
       markPreset("");
       render();
+    });
+    $("mw-include").addEventListener("click", function () {
+      $("include-live").checked = !$("include-live").checked;
+      render();
+      $("mw-include").focus();
+    });
+    [["mw-fresh-more", "fresh"], ["mw-retire-more", "retire"]].forEach(function (b) {
+      $(b[0]).addEventListener("click", function () {
+        state.mwOpen[b[1]] = !state.mwOpen[b[1]];
+        if (state.lastRes) renderMarket(state.lastRes, state.lastProfile);
+      });
     });
     $("tips").addEventListener("click", function (e) {
       var b = e.target && e.target.closest ? e.target.closest(".tip-try") : null;

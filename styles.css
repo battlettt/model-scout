@@ -652,6 +652,30 @@ footer.site p { margin: 0; }
 .conf-legend li span:last-child { font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--muted); }
 .conf-text { margin: var(--s2) 0 0; font-size: 0.9375rem; }
 
+/* ---------- market watch ---------- */
+#market-source { margin-top: var(--s2); max-width: 70ch; }
+.market-grid { display: grid; grid-template-columns: 1fr; gap: var(--s4); align-items: start; }
+@media (min-width: 62em) { .market-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.market-col { padding: var(--s4) var(--s4) var(--s3); min-width: 0; }
+.market-col h3 { display: flex; align-items: baseline; gap: var(--s2); margin: 0; font-size: 1.05rem; }
+.mw-count { font-family: var(--font-mono); font-size: 0.875rem; font-variant-numeric: tabular-nums; color: var(--muted); }
+.mw-list { list-style: none; padding: 0; margin: var(--s3) 0 0; }
+.mw-row { padding: var(--s3) 0; border-top: 1px dotted var(--line); }
+.mw-row p { margin: 0; }
+.mw-name { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s1) var(--s2); font-weight: 650; }
+.mw-name .provider { font-weight: 400; font-size: 0.875rem; color: var(--muted); }
+.mw-facts { margin-top: var(--s1) !important; font-size: 0.9375rem; font-variant-numeric: tabular-nums; }
+.mw-fit { margin-top: var(--s1) !important; font-size: 0.875rem; color: var(--muted); }
+.mw-fit.is-in strong { color: var(--ok); font-weight: 650; }
+.mw-fit.is-out { color: var(--muted); }
+.mw-row.is-down .mw-facts { color: var(--ok); }
+.mw-row.is-yours { border-left: 3px solid var(--warn); padding-left: var(--s3); }
+.mw-row.is-past .mw-facts strong { color: var(--warn); }
+.mw-empty { padding: var(--s3) 0; border-top: 1px dotted var(--line); font-size: 0.9375rem; color: var(--muted); }
+.mw-more { margin-top: var(--s2); }
+.mw-note { margin-top: var(--s3); padding-top: var(--s3); border-top: 1px solid var(--line); }
+.mw-note .btn { margin-top: var(--s2); }
+
 /* ---------- cheaper option under the top pick ---------- */
 .alt-pick {
   max-width: 66ch; margin: var(--s4) 0 0; padding: var(--s3) var(--s4);
@@ -734,6 +758,7 @@ body.has-tray { padding-bottom: 7rem; }
 @media print {
   .sections, .toolbar, .skip, #suggest, .presets, .share-row, .cards-more, .compare-tray, .h2h-actions, .h2h-remove { display: none; }
   .cards .card[hidden] { display: flex !important; }
-  .card-actions, .chat-settings, .chat-form, #side-form, .tip-try, #weights-edit, .weights-reset { display: none; }
+  .card-actions, .chat-settings, .chat-form, #side-form, .tip-try, #weights-edit, .weights-reset, .mw-more { display: none; }
+  .mw-row[hidden] { display: block !important; }
   .panel, .card, .top-pick, .table-wrap { box-shadow: none; }
 }
