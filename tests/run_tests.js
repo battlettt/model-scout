@@ -360,6 +360,14 @@ var orSample = [
   { id: "openrouter/auto", name: "Auto", pricing: { prompt: "-1", completion: "-1" }, architecture: { output_modalities: ["text"] } },
   { id: "z/img", name: "Z: Image", pricing: { prompt: "0.000001", completion: "0.000001" }, architecture: { output_modalities: ["image"] } }
 ];
+test("live input types replace the bundled ones and the change is recorded", function () {
+  var base = [mk({ id: "known", openrouter_id: "x/known", input_modalities: ["image", "text"] })];
+  var r = S.mergeLive(base, orSample, NOW);
+  assert.deepStrictEqual(r.models[0].input_modalities, ["text"]);
+  assert.ok(r.models[0].live.changes.indexOf("inputs image, text to text") >= 0, r.models[0].live.changes.join(" | "));
+  var same = S.mergeLive([mk({ id: "k", openrouter_id: "x/known", input_modalities: ["text"] })], orSample, NOW);
+  assert.ok(!same.models[0].live.changes.some(function (c) { return /^inputs/.test(c); }));
+});
 test("updates bundled prices from live data and records the change", function () {
   var base = [mk({ id: "known", openrouter_id: "x/known", input_price_per_mtok: 1, output_price_per_mtok: 8, context_window: 400000 })];
   var r = S.mergeLive(base, orSample, NOW);
@@ -914,6 +922,18 @@ test("refresh updates listed figures and leaves editorial fields alone", functio
   assert.strictEqual(r.catalog.models[1].last_verified, cat.models[1].last_verified);
   assert.strictEqual(r.catalog.catalog_date, "2026-11-13");
   assert.strictEqual(cat.models[0].input_price_per_mtok, 1, "input catalog was changed in place");
+});
+test("refresh syncs input types from OpenRouter and keeps the reviewed ones when the list has none", function () {
+  var cat = { catalog_date: "2026-01-01", stale_after_days: 90, notes: [], models: [
+    mk({ id: "a", openrouter_id: "acme/a", input_modalities: ["text"] }), mk({ id: "b", openrouter_id: "acme/b", input_modalities: ["image", "text"] })
+  ] };
+  var price = { prompt: "0.000001", completion: "0.000002" };
+  var live = [{ id: "acme/a", pricing: price, architecture: { input_modalities: ["text", "image", "speech"] } }, { id: "acme/b", pricing: price }];
+  var r = refreshTool.refresh(cat, live, "2026-11-14");
+  assert.deepStrictEqual(r.catalog.models[0].input_modalities, ["image", "text"]); // unknown "speech" dropped, A to Z
+  assert.deepStrictEqual(r.catalog.models[1].input_modalities, ["image", "text"]);
+  assert.ok(r.changes.some(function (c) { return /^a: .*input_modalities/.test(c); }), r.changes.join(" | "));
+  assert.ok(!r.changes.some(function (c) { return /^b: .*input_modalities/.test(c); }));
 });
 test("no catalog entry is stale or dated after the catalog itself", function () {
   var at = new Date(catalog.catalog_date + "T12:00:00Z");

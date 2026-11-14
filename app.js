@@ -857,6 +857,11 @@
         json: sp.indexOf("structured_outputs") >= 0 || sp.indexOf("response_format") >= 0,
         reasoning: sp.indexOf("reasoning") >= 0 || sp.indexOf("include_reasoning") >= 0 };
     }
+    var mods = m.architecture && m.architecture.input_modalities;
+    if (Array.isArray(mods)) {
+      var known = SETTING_CHOICES.modality.filter(function (x) { return mods.indexOf(x) >= 0; }).sort(); // the catalog keeps them in A to Z order
+      if (known.length) f.input_modalities = known; // left out when unknown, so a refresh keeps the reviewed value
+    }
     var cr = perMillion(m.pricing && m.pricing.input_cache_read);
     if (cr !== null && cr >= 0) f.cache_read_price_per_mtok = cr;
     var b = byId && byId[m.id + ":batch"];
@@ -892,6 +897,8 @@
       copy.output_price_per_mtok = pout;
       if (isNum(live.context_length)) copy.context_window = live.context_length;
       var facts = liveFacts(live, byId);
+      if (facts.input_modalities && String(facts.input_modalities) !== String((e.input_modalities || ["text"]).slice().sort()))
+        diffs.push("inputs " + (e.input_modalities || ["text"]).join(", ") + " to " + facts.input_modalities.join(", "));
       Object.keys(facts).forEach(function (k) { copy[k] = facts[k]; });
       copy.price_status = "live";
       copy.last_verified = stamp;

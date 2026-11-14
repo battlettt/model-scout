@@ -7,7 +7,7 @@
 //   node tools/refresh_catalog.js /tmp/openrouter-models.json --date 2026-11-13
 //
 // For every catalog entry with an openrouter_id that the list contains, it updates the prices, context window,
-// capabilities, cache and batch prices, output limit, retirement and listing dates, sets price_status to
+// capabilities, input types, cache and batch prices, output limit, retirement and listing dates, sets price_status to
 // "verified", and stamps last_verified and the source with the snapshot date. Editorial fields (quality_tier,
 // latency_class, task_fit, strengths, limits, local_hardware) are never touched. Entries the list does not
 // contain are reported and left alone, so they go stale on their own dates.
