@@ -609,6 +609,24 @@ test("market watch without live data: says so, and compares no prices", function
   });
 });
 
+test("monthly limit: a link with cap leaves out pricier models, offers to lift it, and clearing it restores the pick", function () {
+  var base = "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3";
+  var p = boot({ url: base + "&cap=100" });
+  function top() { return p.d.querySelector("#top-pick h3").firstChild.textContent.trim(); }
+  return settled(p).then(function () {
+    ok(p.$("monthly-cap").value === "100", "field: " + p.$("monthly-cap").value);
+    ok(top() === "DeepSeek V4.1 Flash", "top: " + top());
+    ok(/Grok 4\.7[\s\S]*over your \$100 monthly limit/.test(p.$("excluded").textContent), "excluded: " + p.$("excluded").textContent.slice(0, 300));
+    var lever = null;
+    Array.prototype.forEach.call(p.d.querySelectorAll("#whatif .wi"), function (li) { if (/Remove the \$100 monthly limit/.test(li.textContent)) lever = li; });
+    ok(lever && /Grok 4\.7/.test(lever.textContent), "cap lever: " + p.$("whatif").textContent.slice(0, 300));
+    p.$("monthly-cap").value = ""; fire(p, "monthly-cap");
+    ok(top() === "Grok 4.7" && !/cap=/.test(p.w.location.search), "cleared: " + top() + " " + p.w.location.search);
+    p.$("monthly-cap").value = "-3"; fire(p, "monthly-cap");
+    ok(/no monthly limit/.test(p.$("monthly-cap-error").textContent) && top() === "Grok 4.7", "bad value: " + p.$("monthly-cap-error").textContent);
+  });
+});
+
 test("what if: levers show under the pick; apply one, then undo it", function () {
   var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
   var first;

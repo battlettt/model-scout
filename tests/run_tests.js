@@ -803,6 +803,47 @@ test("the memo names the tipping point and says when weights were set by hand", 
   assert.ok(/- Weights: from the profile/.test(md2) && !/Tipping point/.test(md2));
 });
 
+section("Monthly spend limit");
+test("a monthly limit leaves out models that cost more at the volume, and says by how much", function () {
+  var dear = mk({ id: "dear", quality_tier: 5 }), cheap = mk({ id: "cheap", input_price_per_mtok: 0.1, output_price_per_mtok: 0.4 });
+  var res = S.rankModels([dear, cheap], profile({ monthlyCap: 50 }), NOW); // dear: 50 x $1 + 10 x $4 = $90
+  assert.deepStrictEqual(res.ranked.map(function (r) { return r.model.id; }), ["cheap"]);
+  assert.strictEqual(res.excluded[0].excludeReason, "About $90.00 a month at your volume, over your $50 monthly limit.");
+  assert.strictEqual(S.rankModels([dear], profile({ monthlyCap: 90 }), NOW).ranked.length, 1, "a cost equal to the limit fits");
+  assert.strictEqual(S.rankModels([dear], profile({ monthlyCap: 0 }), NOW).ranked.length, 1, "0 means no limit");
+});
+test("the monthly limit flags unknown prices, skips self-hosted ranking, and counts batch and cache", function () {
+  var unknown = mk({ id: "u", input_price_per_mtok: null, output_price_per_mtok: null, price_status: "unverified" });
+  var r = S.rankModels([unknown], profile({ monthlyCap: 10 }), NOW);
+  assert.ok(r.ranked.length === 1 && r.ranked[0].flags.some(function (f) { return /checked against your monthly limit/.test(f); }));
+  var open = mk({ id: "o", open_weights: true, local_hardware: "single-gpu" });
+  assert.strictEqual(S.rankModels([open], profile({ monthlyCap: 1, localOnly: true }), NOW).ranked.length, 1);
+  var batch = mk({ id: "b", batch_input_price_per_mtok: 0.5, batch_output_price_per_mtok: 2 }); // $45 with batch
+  assert.strictEqual(S.rankModels([batch], profile({ monthlyCap: 50 }), NOW).ranked.length, 0);
+  assert.strictEqual(S.rankModels([batch], profile({ monthlyCap: 50, useBatch: true }), NOW).ranked.length, 1);
+});
+test("the monthly limit travels in the link as cap, in the memo, as a lever, and from the description", function () {
+  var q = S.encodeSettings({ monthlyCap: 250 });
+  assert.strictEqual(q, "cap=250");
+  assert.strictEqual(S.decodeSettings("?cap=250").settings.monthlyCap, 250);
+  ["cap=0", "cap=-5", "cap=abc", "cap=99999999"].forEach(function (bad) { assert.strictEqual(S.decodeSettings("?" + bad).settings.monthlyCap, undefined, bad); });
+  assert.strictEqual(S.profileFromSettings({ monthlyCap: 250 }).monthlyCap, 250);
+  var ids = S.leverOptions(S.presetSettings("support")).map(function (o) { return o.id; });
+  assert.ok(ids.indexOf("cap") < 0, "no lever without a limit");
+  var withCap = S.leverOptions(Object.assign(S.presetSettings("support"), { monthlyCap: 40 }));
+  var cap = withCap.filter(function (o) { return o.id === "cap"; })[0];
+  assert.ok(cap && cap.settings.monthlyCap === null && cap.label === "Remove the $40 monthly limit", JSON.stringify(cap));
+  [["Support bot, budget of $200 a month", 200], ["about $1.5k/month for summaries", 1500], ["$2,000 per month max", 2000], ["$75/mo", 75]].forEach(function (c) {
+    var sg = S.suggestFromText(c[0]).settings;
+    assert.strictEqual(sg.monthlyCap, c[1], c[0]);
+    assert.strictEqual(sg.budget, undefined, "a named monthly limit replaces the per-token guess: " + c[0]);
+  });
+  assert.strictEqual(S.suggestFromText("cheap classifier").settings.monthlyCap, undefined);
+  var p = S.profileFromSettings(Object.assign(S.presetSettings("support"), { monthlyCap: 400 }));
+  var memo = S.decisionMemo({ res: S.rankModels(models, p, NOW), p: p, now: NOW, catalogDate: catalog.catalog_date });
+  assert.ok(/Monthly spend limit: \$400 at this volume/.test(memo), memo.slice(0, 600));
+});
+
 section("What if one constraint changed");
 test("lever options change one setting and keep the rest", function () {
   var base = S.presetSettings("coding-agent"), opts = S.leverOptions(base);
