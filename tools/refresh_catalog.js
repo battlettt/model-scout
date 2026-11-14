@@ -8,6 +8,10 @@
 //   curl -s https://openrouter.ai/api/v1/endpoints/zdr -o /tmp/openrouter-zdr.json
 //   node tools/refresh_catalog.js /tmp/openrouter-models.json --zdr /tmp/openrouter-zdr.json
 //     (also records each model's zero-data-retention endpoints: count, providers, cheapest prices)
+//   mkdir -p /tmp/or-endpoints && for id in $(node -e 'require("./catalog.json").models.forEach(m=>m.openrouter_id&&console.log(m.openrouter_id))'); do
+//     curl -s "https://openrouter.ai/api/v1/models/$id/endpoints" -o "/tmp/or-endpoints/$(echo $id | tr / _).json"; done
+//   node tools/refresh_catalog.js /tmp/openrouter-models.json --endpoints /tmp/or-endpoints
+//     (also records each model's hosts: endpoint count, provider names, stated quantizations; status and uptime are not kept)
 //
 // For every catalog entry with an openrouter_id that the list contains, it updates the prices, context window,
 // capabilities, input types, cache and batch prices, output limit, retirement and listing dates, sets price_status to
@@ -26,11 +30,12 @@ var SOURCE_NAME = "OpenRouter public models API (https://openrouter.ai/api/v1/mo
 function today() { return new Date().toISOString().slice(0, 10); }
 
 function args(argv) {
-  var a = { file: null, dryRun: false, date: today(), zdr: null };
+  var a = { file: null, dryRun: false, date: today(), zdr: null, endpoints: null };
   for (var i = 0; i < argv.length; i++) {
     if (argv[i] === "--dry-run") a.dryRun = true;
     else if (argv[i] === "--date") a.date = argv[++i];
     else if (argv[i] === "--zdr") a.zdr = argv[++i];
+    else if (argv[i] === "--endpoints") a.endpoints = argv[++i];
     else if (!a.file) a.file = argv[i];
   }
   if (!a.file) throw new Error("Pass the path of a saved OpenRouter model list (see the comment at the top of this file).");
@@ -38,8 +43,9 @@ function args(argv) {
   return a;
 }
 
-/** Pure: the refreshed catalog plus a list of human-readable changes. Exported for tests. */
-function refresh(catalog, orData, date, zdrList) {
+/** Pure: the refreshed catalog plus a list of human-readable changes. Exported for tests.
+ *  hostsById maps an OpenRouter id to the data object of its endpoint list; ids it lacks keep their hosts. */
+function refresh(catalog, orData, date, zdrList, hostsById) {
   var byId = {};
   (orData || []).forEach(function (m) { if (m && m.id) byId[m.id] = m; });
   var changes = [], missing = [], updated = 0;
@@ -51,6 +57,12 @@ function refresh(catalog, orData, date, zdrList) {
       if (zb !== JSON.stringify(z)) changes.push(e.id + ": zdr " + (e.zdr ? e.zdr.endpoints : "none") + " -> " + z.endpoints + (z.endpoints === 1 ? " endpoint" : " endpoints") +
         (z.endpoints ? ", cheapest " + z.cheapest + " $" + z.input_price_per_mtok + " / $" + z.output_price_per_mtok : ""));
       e.zdr = z;
+    }
+    if (hostsById && Object.prototype.hasOwnProperty.call(hostsById, e.openrouter_id)) {
+      var h = S.hostsFacts(hostsById[e.openrouter_id]), hb = JSON.stringify(e.hosts === undefined ? null : e.hosts);
+      if (hb !== JSON.stringify(h)) changes.push(e.id + ": hosts " + (e.hosts ? e.hosts.providers.length : "none") + " -> " + h.providers.length +
+        (h.providers.length === 1 ? " provider" : " providers") + ", " + h.endpoints + (h.endpoints === 1 ? " endpoint" : " endpoints"));
+      e.hosts = h;
     }
     var live = byId[e.openrouter_id];
     if (!live || !live.pricing) { missing.push(e.id); return; }
@@ -74,6 +86,7 @@ function refresh(catalog, orData, date, zdrList) {
   });
   out.catalog_date = date;
   if (zdrList) out.zdr_snapshot = date;
+  if (hostsById) out.hosts_snapshot = date;
   return { catalog: out, updated: updated, changes: changes, missing: missing };
 }
 
@@ -87,7 +100,16 @@ function main() {
     zdr = JSON.parse(fs.readFileSync(a.zdr, "utf8"));
     if (!zdr || !Array.isArray(zdr.data)) throw new Error("That --zdr file is not OpenRouter's ZDR endpoint list (no data array).");
   }
-  var r = refresh(JSON.parse(fs.readFileSync(catalogPath, "utf8")), list.data, a.date, zdr && zdr.data);
+  var hosts = null;
+  if (a.endpoints) {
+    hosts = {};
+    fs.readdirSync(a.endpoints).filter(function (f) { return /\.json$/.test(f); }).forEach(function (f) {
+      var j = JSON.parse(fs.readFileSync(path.join(a.endpoints, f), "utf8"));
+      if (j && j.data && typeof j.data.id === "string" && Array.isArray(j.data.endpoints)) hosts[j.data.id] = j.data;
+      else console.log("Skipped " + f + ": not an OpenRouter endpoint list.");
+    });
+  }
+  var r = refresh(JSON.parse(fs.readFileSync(catalogPath, "utf8")), list.data, a.date, zdr && zdr.data, hosts);
   var bad = [];
   r.catalog.models.forEach(function (e) { var errs = S.validateEntry(e); if (errs.length) bad.push(e.id + ": " + errs.join("; ")); });
   console.log("Snapshot " + a.date + ": " + r.updated + " entries refreshed from " + list.data.length + " listed models.");

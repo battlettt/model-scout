@@ -648,6 +648,22 @@ test("zero data retention: the checkbox drops models with no ZDR endpoint, repri
   });
 });
 
+test("backup host: a link with backup=1 checks the box, leaves out one-host models, and unchecking restores them", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&speed=fast&budget=1&in=300&out=30&cache=50&zdr=1&backup=1" });
+  function ranked() { return p.d.querySelectorAll("#compare-body tr").length; }
+  return settled(p).then(function () {
+    ok(p.$("need-backup").checked, "box should be checked from the link");
+    ok(/^\d{4}-\d{2}-\d{2}$/.test(p.$("hosts-date").textContent), "snapshot date: " + p.$("hosts-date").textContent);
+    ok(/Only one zero-data-retention host \((Azure|Google|Mistral|xAI)\) on OpenRouter/.test(p.$("excluded").textContent), "excluded: " + p.$("excluded").textContent.slice(0, 300));
+    ok(/\d+ without a backup host/.test(p.$("excluded-summary").textContent), "summary: " + p.$("excluded-summary").textContent);
+    ok(/Hosted by \d+ providers on OpenRouter/.test(p.$("cards").textContent), "card hosts line missing");
+    var before = ranked();
+    p.$("need-backup").checked = false; fire(p, "need-backup", "change");
+    ok(!/backup=/.test(p.w.location.search), "address: " + p.w.location.search);
+    ok(ranked() > before && !/without a backup host/.test(p.$("excluded-summary").textContent), "rows " + before + " -> " + ranked());
+  });
+});
+
 test("test kit: lists the shortlist plus the split pick, downloads a script, and is withheld for local only", function () {
   var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
   var saved = null;

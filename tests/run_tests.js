@@ -910,6 +910,85 @@ test("every catalog model listed on OpenRouter has ZDR data from a dated snapsho
   models.filter(function (m) { return m.openrouter_id; }).forEach(function (m) { assert.ok(m.zdr && S.validateEntry(m).length === 0, m.id + " has no zdr data"); });
 });
 
+section("Hosts and a backup host");
+var epData = { id: "acme/a", endpoints: [
+  { provider_name: "Beta", quantization: "fp8" }, { provider_name: "Alpha", quantization: "unknown" },
+  { provider_name: "Beta", quantization: "BF16" }, { provider_name: "Gamma", quantization: "fp4" }, null
+] };
+test("hostsFacts counts listed endpoints, names each provider once, and keeps only stated precisions", function () {
+  var h = S.hostsFacts(epData);
+  assert.deepStrictEqual(h, { endpoints: 4, providers: ["Alpha", "Beta", "Gamma"], quantizations: ["bf16", "fp4", "fp8"] });
+  assert.deepStrictEqual(S.hostsFacts({ id: "x", endpoints: [] }), { endpoints: 0, providers: [], quantizations: [] });
+  assert.deepStrictEqual(S.hostsFacts(null), { endpoints: 0, providers: [], quantizations: [] });
+  assert.deepStrictEqual(S.validateEntry(mk({ hosts: h })), []);
+  assert.ok(S.validateEntry(mk({ hosts: { endpoints: 1, providers: ["A", "B"], quantizations: [] } })).length > 0, "more providers than endpoints");
+  assert.ok(S.validateEntry(mk({ hosts: { endpoints: 2, providers: ["A", 3], quantizations: [] } })).length > 0, "a provider that is not a name");
+  assert.ok(S.validateEntry(mk({ hosts: { endpoints: 2, providers: ["A"] } })).length > 0, "no quantizations list");
+  assert.ok(S.validateEntry(mk({ hosts: [] })).length > 0, "a list is not hosts data");
+});
+test("a backup host requirement leaves out one-host models, flags unknown ones, and skips local only", function () {
+  function hosts(names) { return { endpoints: names.length, providers: names, quantizations: [] }; }
+  var res = S.rankModels([mk({ id: "one", hosts: hosts(["Solo"]) }), mk({ id: "none", hosts: hosts([]) }), mk({ id: "two", hosts: hosts(["A", "B"]) }), mk({ id: "unknown" })],
+    profile({ backupHost: true }), NOW);
+  assert.deepStrictEqual(res.excluded.map(function (r) { return r.model.id; }).sort(), ["none", "one"]);
+  var why = {}; res.excluded.forEach(function (r) { why[r.model.id] = r.excludeReason; });
+  assert.strictEqual(why.one, "Only one host (Solo) on OpenRouter, and your profile needs a backup host.");
+  assert.strictEqual(why.none, "No host on OpenRouter, and your profile needs a backup host.");
+  assert.strictEqual(S.exclusionSummary(res.excluded), "2 left out: 2 without a backup host.");
+  var unk = res.ranked.filter(function (r) { return r.model.id === "unknown"; })[0];
+  assert.ok(unk.flags.some(function (f) { return /^Backup host not confirmed: no hosting data/.test(f); }), unk.flags.join(" | "));
+  assert.strictEqual(S.rankModels([mk({ id: "one", hosts: hosts(["Solo"]) })], profile({ backupHost: false }), NOW).ranked.length, 1, "off by default");
+  assert.strictEqual(S.rankModels([mk({ id: "one", hosts: hosts(["Solo"]), open_weights: true, local_hardware: "laptop" })], profile({ backupHost: true, localOnly: true }), NOW).ranked.length, 1, "local only has no host to back up");
+});
+test("with zero data retention also required, only zero-data-retention providers count as hosts", function () {
+  var z1 = { endpoints: 2, providers: ["Azure"], cheapest: "Azure", input_price_per_mtok: 1, output_price_per_mtok: 4, cache_read_price_per_mtok: null };
+  var z2 = Object.assign({}, z1, { providers: ["Azure", "Bedrock"] });
+  var many = { endpoints: 8, providers: ["Azure", "Bedrock", "OpenAI"], quantizations: [] };
+  var m1 = mk({ id: "z1", hosts: many, zdr: z1 }), m2 = mk({ id: "z2", hosts: many, zdr: z2 });
+  var p = profile({ backupHost: true, zdr: true }), res = S.rankModels([m1, m2, mk({ id: "nz", hosts: many })], p, NOW);
+  assert.deepStrictEqual(res.ranked.map(function (r) { return r.model.id; }).sort(), ["nz", "z2"]);
+  assert.strictEqual(res.excluded[0].excludeReason, "Only one zero-data-retention host (Azure) on OpenRouter, and your profile needs a backup host.");
+  assert.ok(res.ranked.filter(function (r) { return r.model.id === "nz"; })[0].flags.some(function (f) { return /no zero-data-retention data/.test(f); }));
+  assert.deepStrictEqual([S.hostCount(m1, p), S.hostCount(m1, profile()), S.hostCount(mk({}), profile())], [1, 3, null]);
+});
+test("cards name the hosts, warn about a single host, and note reduced precision", function () {
+  assert.strictEqual(S.hostsText({ hosts: S.hostsFacts(epData) }),
+    "Hosted by 3 providers on OpenRouter (Alpha, Beta, Gamma), 4 endpoints. Some hosts serve reduced precision (fp4, fp8), which OpenRouter says can lower quality on some prompts.");
+  assert.strictEqual(S.hostsText({ hosts: { endpoints: 1, providers: ["Mistral"], quantizations: [] } }), "One host on OpenRouter (Mistral, 1 endpoint): no other provider to fail over to.");
+  assert.strictEqual(S.hostsText({ hosts: { endpoints: 6, providers: ["A", "B", "C", "D", "E", "F"], quantizations: ["bf16"] } }), "Hosted by 6 providers on OpenRouter (A, B, C, D and 2 more), 6 endpoints.");
+  assert.strictEqual(S.hostsText({ hosts: { endpoints: 0, providers: [], quantizations: [] } }), "Hosts on OpenRouter: none listed in the snapshot.");
+  assert.strictEqual(S.hostsText({}), "");
+});
+test("the backup host travels in the link, the memo, the levers, the comparison, the CSV, and the description hints", function () {
+  assert.strictEqual(S.encodeSettings({ backupHost: true }), "backup=1");
+  assert.strictEqual(S.decodeSettings("?backup=1").settings.backupHost, true);
+  assert.strictEqual(S.profileFromSettings({ backupHost: true }).backupHost, true);
+  assert.deepStrictEqual(S.settingsDiff({}, { backupHost: true }), ["Backup host: off to on"]);
+  var ids = S.leverOptions(S.presetSettings("support")).map(function (o) { return o.id; });
+  assert.ok(ids.indexOf("backup") >= 0 && ids.indexOf("drop-backup") < 0, ids.join(","));
+  var on = S.leverOptions(Object.assign(S.presetSettings("support"), { backupHost: true })).map(function (o) { return o.id; });
+  assert.ok(on.indexOf("drop-backup") >= 0 && on.indexOf("backup") < 0, on.join(","));
+  assert.ok(S.leverOptions(S.presetSettings("private")).every(function (o) { return !/backup/.test(o.id); }), "no backup lever when local only");
+  ["We cannot afford an outage on the support line", "needs failover to a second provider", "99.9% uptime target"].forEach(function (t) {
+    assert.strictEqual(S.suggestFromText(t).settings.backupHost, true, t);
+  });
+  assert.ok(!S.suggestFromText("Summarise our tickets").settings.backupHost);
+  var p = S.profileFromSettings({ backupHost: true, zdr: true }), res = S.rankModels(models, p, NOW);
+  assert.ok(/Backup host: required, two or more zero-data-retention providers on OpenRouter/.test(S.decisionMemo({ res: res, p: p, now: NOW })));
+  assert.ok(/Backup host: not required/.test(S.decisionMemo({ res: S.rankModels(models, profile(), NOW), p: profile(), now: NOW })));
+  var h2h = S.headToHead(res.ranked.slice(0, 2), p), row = h2h.rows.filter(function (r) { return r.label === "Zero-data-retention hosts"; })[0];
+  assert.ok(row && row.cells.every(function (c) { return /^\d+$/.test(c); }), JSON.stringify(row));
+  assert.ok(!S.headToHead(res.ranked.slice(0, 2), profile({ localOnly: true })).rows.some(function (r) { return /hosts/i.test(r.label); }), "no hosts row for local only");
+  assert.strictEqual(S.tableCsv(res, p).split("\r\n")[0].split(",")[13], "zdr_hosts");
+  assert.strictEqual(S.tableCsv(res, profile()).split("\r\n")[0].split(",")[13], "openrouter_hosts");
+});
+test("every catalog model listed on OpenRouter has hosts data from a dated snapshot", function () {
+  assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(catalog.hosts_snapshot || ""), "hosts_snapshot missing");
+  models.filter(function (m) { return m.openrouter_id; }).forEach(function (m) {
+    assert.ok(m.hosts && m.hosts.providers.length > 0 && S.validateEntry(m).length === 0, m.id + " has no hosts data");
+  });
+});
+
 section("Split traffic with a cheaper model");
 test("route options are the ranked models cheaper than the top pick, in rank order", function () {
   var top = mk({ id: "top", quality_tier: 5 }), mid = mk({ id: "mid", quality_tier: 4, input_price_per_mtok: 0.5, output_price_per_mtok: 2 });
@@ -982,9 +1061,9 @@ test("the CSV has one row per ranked model, quotes commas and quotes, and defuse
   var lines = S.tableCsv(res, profile()).split("\r\n");
   assert.strictEqual(lines[0].split(",")[0], "rank"); assert.strictEqual(lines.length, 3); assert.strictEqual(lines[2], "");
   assert.ok(lines[1].indexOf('"Odd, ""quoted"" model"') > 0 && lines[1].indexOf("'=HYPERLINK(1)") > 0, lines[1]);
-  assert.ok(/,90,1,4,1000000,verified,/.test(lines[1]), "monthly cost and list prices: " + lines[1]);
+  assert.ok(/,90,1,4,1000000,,verified,/.test(lines[1]), "monthly cost and list prices: " + lines[1]);
   var lp = profile({ localOnly: true }), local = S.rankModels([mk({ id: "o", open_weights: true, local_hardware: "laptop" })], lp, NOW);
-  assert.ok(/,100,,1,4,1000000,/.test(S.tableCsv(local, lp).split("\r\n")[1]), "no monthly cost for local only: " + S.tableCsv(local, lp));
+  assert.ok(/,100,,1,4,1000000,,/.test(S.tableCsv(local, lp).split("\r\n")[1]), "no monthly cost for local only: " + S.tableCsv(local, lp));
 });
 
 section("Pinned scenario");
@@ -1156,6 +1235,18 @@ test("refresh with a ZDR list records each model's endpoints and the snapshot da
   assert.ok(r.changes.some(function (c) { return /^a: zdr none -> 3 endpoints, cheapest Beta/.test(c); }), r.changes.join(" | "));
   var again = refreshTool.refresh(r.catalog, live, "2026-11-15");
   assert.strictEqual(again.catalog.models[0].zdr.endpoints, 3); assert.strictEqual(again.catalog.zdr_snapshot, "2026-11-14");
+});
+test("refresh with endpoint lists records each listed model's hosts and the snapshot date; ids without a list keep theirs", function () {
+  var kept = { endpoints: 1, providers: ["Old"], quantizations: [] };
+  var cat = { catalog_date: "2026-01-01", stale_after_days: 90, notes: [], models: [mk({ id: "a", openrouter_id: "acme/a" }), mk({ id: "b", openrouter_id: "acme/b", hosts: kept })] };
+  var live = [{ id: "acme/a", pricing: { prompt: "0.000001", completion: "0.000004" } }];
+  var r = refreshTool.refresh(cat, live, "2026-11-14", null, { "acme/a": epData });
+  assert.strictEqual(r.catalog.hosts_snapshot, "2026-11-14");
+  assert.deepStrictEqual(r.catalog.models[0].hosts.providers, ["Alpha", "Beta", "Gamma"]);
+  assert.deepStrictEqual(r.catalog.models[1].hosts, kept, "no list for acme/b, so its hosts stay");
+  assert.ok(r.changes.some(function (c) { return c === "a: hosts none -> 3 providers, 4 endpoints"; }), r.changes.join(" | "));
+  var again = refreshTool.refresh(r.catalog, live, "2026-11-15");
+  assert.strictEqual(again.catalog.models[0].hosts.endpoints, 4); assert.strictEqual(again.catalog.hosts_snapshot, "2026-11-14");
 });
 test("no catalog entry is stale or dated after the catalog itself", function () {
   var at = new Date(catalog.catalog_date + "T12:00:00Z");
