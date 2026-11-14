@@ -409,6 +409,18 @@ test("the cache discount is not stacked on a batch price", function () {
   var e = S.effectivePrices(m, { useBatch: true, cacheShare: 0.5 });
   assert.strictEqual(e.input, 1); assert.strictEqual(e.cache, false);
 });
+test("with batch and cache both on, the one that costs less for the token mix is used, never both", function () {
+  var m = mk({ input_price_per_mtok: 2, output_price_per_mtok: 8, batch_input_price_per_mtok: 1, batch_output_price_per_mtok: 4, cache_read_price_per_mtok: 0.2 });
+  // Input-heavy and mostly cached: 0.1 x 2 + 0.9 x 0.2 = 0.38 per 1M input beats the batch price of 1.
+  var e = S.effectivePrices(m, { useBatch: true, cacheShare: 0.9, inputTokens: 200e6, outputTokens: 2e6 });
+  close(e.input, 0.38); assert.strictEqual(e.output, 8); assert.ok(e.cache && !e.batch && e.batchSkipped);
+  // Output-heavy: the batch price halves the output, so batch wins.
+  var b = S.effectivePrices(m, { useBatch: true, cacheShare: 0.9, inputTokens: 1e6, outputTokens: 20e6 });
+  assert.ok(b.batch && !b.cache && !b.batchSkipped);
+  var p = profile({ useBatch: true, cacheShare: 0.9, inputTokens: 200e6, outputTokens: 2e6 });
+  var r = S.scoreModel(m, p, S.computeWeights(p), NOW);
+  assert.ok(r.notes.some(function (n) { return /prompt cache costs less for your mix/.test(n); }), r.notes.join(" | "));
+});
 test("unknown list price stays unknown with options on", function () {
   assert.strictEqual(S.monthlyCost(mk({ input_price_per_mtok: null, price_status: "unverified" }), 1e6, 1e6, { cacheShare: 0.5, useBatch: true }), null);
 });
@@ -763,6 +775,48 @@ test("the memo names the tipping point and says when weights were set by hand", 
   assert.ok(/- Weights: from the profile/.test(md2) && !/Tipping point/.test(md2));
 });
 
+section("What if one constraint changed");
+test("lever options change one setting and keep the rest", function () {
+  var base = S.presetSettings("coding-agent"), opts = S.leverOptions(base);
+  var ids = opts.map(function (o) { return o.id; });
+  ["quality-down", "drop-tools", "local", "context"].forEach(function (id) { assert.ok(ids.indexOf(id) >= 0, "missing lever " + id + " in " + ids.join(",")); });
+  assert.ok(ids.indexOf("cache") < 0, "cache is already above half, so no cache lever");
+  opts.forEach(function (o) {
+    var changed = Object.keys(base).filter(function (k) { return JSON.stringify(base[k]) !== JSON.stringify(o.settings[k]); });
+    assert.ok(changed.length >= 1 && changed.length <= 3, o.id + " changed " + changed.join(","));
+    assert.ok(o.label && !/\u2014/.test(o.label));
+  });
+  var drop = opts.filter(function (o) { return o.id === "drop-tools"; })[0];
+  assert.strictEqual(drop.settings.tools, false); assert.strictEqual(drop.settings.cacheShare, base.cacheShare);
+  var local = S.leverOptions(S.presetSettings("private")).map(function (o) { return o.id; });
+  assert.ok(local.indexOf("hosted") >= 0 && local.indexOf("batch") < 0 && local.indexOf("cache") < 0, local.join(","));
+});
+test("what if keeps only levers that move the pick or save 5%, pick changes first", function () {
+  var w = S.whatIfs(models, S.presetSettings("contracts"), NOW);
+  assert.ok(w && w.levers.length >= 2, "levers: " + (w && w.levers.length));
+  var seenSame = false;
+  w.levers.forEach(function (lv) {
+    if (!lv.pickChanged) seenSame = true;
+    else assert.ok(!seenSame, "a pick change came after a same-pick lever");
+    if (!lv.pickChanged) assert.ok(lv.delta < 0 && -lv.delta / w.base.cost >= 0.05, lv.id + " kept without a 5% saving");
+    var p = S.profileFromSettings(lv.settings), r = S.rankModels(models, p, NOW);
+    assert.strictEqual(r.ranked[0].model.id, lv.top.id, lv.id + ": reported pick does not match a re-rank");
+  });
+});
+test("what if quotes no saving when either side is self-hosted", function () {
+  var w = S.whatIfs(models, S.presetSettings("coding-agent"), NOW);
+  var local = w.levers.filter(function (lv) { return lv.id === "local"; })[0];
+  assert.ok(local && local.selfHosted && local.delta === null && local.cost === null);
+  var wp = S.whatIfs(models, S.presetSettings("private"), NOW);
+  wp.levers.forEach(function (lv) { assert.strictEqual(lv.delta, null, lv.id + " should not quote a saving from a self-hosted base"); });
+});
+test("what if returns null when nothing is ranked, and the memo lists the levers", function () {
+  assert.strictEqual(S.whatIfs([mk({ open_weights: false })], { localOnly: true }, NOW), null);
+  var st = S.presetSettings("contracts"), p = S.profileFromSettings(st), res = S.rankModels(models, p, NOW);
+  var md = S.decisionMemo({ res: res, p: p, now: NOW, whatIf: S.whatIfs(models, st, NOW) });
+  assert.ok(/## If one constraint changed\n- Accept a good quality bar instead of frontier: .+ comes first, \$[\d.,]+ a month less/.test(md), md);
+});
+
 section("Market watch");
 function daysBefore(n) { return new Date(NOW.getTime() - n * 864e5).toISOString().slice(0, 10); }
 test("mergeLive keeps the snapshot price so a price move can be shown", function () {
@@ -848,9 +902,11 @@ test("no catalog entry is stale or dated after the catalog itself", function () 
 
 section("Static checks: paths, copy, secrets");
 var html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
+// An inline image (data:image/...) makes no request, so the favicon may use one.
+function inlineImage(r) { return /^data:image\/svg\+xml,/.test(r); }
 test("every asset reference in index.html is relative", function () {
   var refs = [], re = /\b(?:src|href)\s*=\s*"([^"]*)"/g, m;
-  while ((m = re.exec(html))) refs.push(m[1]);
+  while ((m = re.exec(html))) if (!inlineImage(m[1])) refs.push(m[1]);
   assert.ok(refs.length > 0);
   refs.forEach(function (r) {
     assert.ok(r[0] !== "/", "absolute path: " + r);
@@ -935,6 +991,7 @@ test("every profile field from v1 is still in the form", function () {
 test("every relative asset reference resolves to a file in the repo", function () {
   var re = /\b(?:src|href)\s*=\s*"([^"#][^"]*)"/g, m, n = 0;
   while ((m = re.exec(html))) {
+    if (inlineImage(m[1])) continue;
     var ref = m[1].split(/[?#]/)[0];
     assert.ok(!/^\/|^[a-z]+:/i.test(ref), "absolute or external path: " + ref);
     assert.ok(fs.existsSync(path.join(ROOT, ref)), "broken asset reference: " + ref);

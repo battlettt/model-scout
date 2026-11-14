@@ -590,6 +590,30 @@ test("market watch without live data: says so, and compares no prices", function
   });
 });
 
+test("what if: levers show under the pick; apply one, then undo it", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
+  var first;
+  return settled(p).then(function () {
+    first = p.d.querySelector("#top-pick h3").firstChild.textContent.trim();
+    var items = p.d.querySelectorAll("#whatif .wi");
+    ok(items.length >= 2, "levers: " + items.length);
+    var batch = null;
+    Array.prototype.forEach.call(items, function (li) { if (/batch run/.test(li.textContent)) batch = li; });
+    ok(batch && /comes first/.test(batch.textContent), "batch lever missing: " + p.$("whatif").textContent.slice(0, 200));
+    var named = batch.querySelector(".wi-out strong").textContent;
+    batch.querySelector("[data-lever]").click();
+    ok(p.$("use-batch").checked && /batch=1/.test(p.w.location.search), "lever not applied: " + p.w.location.search);
+    ok(p.d.querySelector("#top-pick h3").firstChild.textContent.trim() === named, "pick should be " + named);
+    ok(!p.$("whatif-undo").hidden && /Applied: The work can wait/.test(p.$("whatif-status").textContent), "undo should show");
+    p.$("whatif-undo").click();
+    ok(!p.$("use-batch").checked && p.d.querySelector("#top-pick h3").firstChild.textContent.trim() === first && p.$("whatif-undo").hidden, "undo should restore the settings");
+    batch = p.d.querySelector("#whatif [data-lever]");
+    batch.click();
+    p.$("quality").value = "good"; fire(p, "quality", "input");
+    ok(p.$("whatif-undo").hidden && p.$("whatif-status").textContent === "", "a later edit should drop the undo");
+  });
+});
+
 (function run(i) {
   if (i >= cases.length) {
     console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");

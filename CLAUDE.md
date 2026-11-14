@@ -11,12 +11,12 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - Honesty rule: no invented benchmarks or specs. Unverified specs are flagged, never presented as current.
 - Ask a model (section 3): chat with one model, or one question to two models side by side; "Ask this model" on every card.
 - Presets (seven common cases) and shareable links: the form settings live in the query string (`encodeSettings` / `decodeSettings`); the task description never does.
-- Hard capability constraints (tool calling, JSON output, reasoning mode), prompt-cache share and batch prices in the cost math, retirement dates as warnings.
+- Hard capability constraints (tool calling, JSON output, reasoning mode), prompt-cache share and batch prices in the cost math (never stacked: `effectivePrices` uses whichever is cheaper for the token mix, `batchSkipped` when the cache wins), retirement dates as warnings.
 - Confidence check on the top pick (`robustness`): 300 seeded reruns with each weight scaled between half and double; reports ties and dominated runners-up.
 - Value map (`valueMapSvg`, `frontier`): score against monthly cost on a log scale, with the Pareto frontier; drawn at the container width. "Cheaper option within 5 points" under the top pick (`cheaperAlternative`).
-- Tipping points (`tippingPoints`): per factor, the exact weight share at which another model comes first (scores are linear in one share when the others keep their proportions). "Try it" (`tipWeights`) sets whole-percent weights just past the tip, verified by re-ranking.
-- Hand-set weights (`normalizeWeights`, link key `w=cost-quality-speed-context-privacy`, one decimal): sliders in the weights box replace the profile weights; hard constraints still apply. "Back to profile weights" clears them.
+- Tipping points (`tippingPoints`): per factor, the exact weight share at which another model comes first (scores are linear in one share when the others keep their proportions). "Try it" (`tipWeights`) sets whole-percent weights just past the tip, verified by re-ranking. Hand-set weights (`normalizeWeights`, link key `w=cost-quality-speed-context-privacy`, one decimal): sliders in the weights box replace the profile weights; hard constraints still apply. "Back to profile weights" clears them.
 - Market watch (section 5, `marketWatch`): models first listed on OpenRouter in the last 30 days (`listed_on`), reviewed models whose live price differs from the snapshot (`mergeLive` keeps it in `live.before`), and listed retirement dates. Each row is checked against the profile's hard limits with a monthly cost. Bundled-only mode says so and compares no prices.
+- What if (`leverOptions`, `whatIfs`): one constraint changed at a time, re-ranked; kept only when the pick moves or the same pick saves at least 5%. No saving is quoted when either side is local only. Apply sets the form; Undo restores it until the next edit. The memo lists the levers.
 - Compare tray and head to head (`headToHead`, up to 3 models), with "Ask the first two side by side". Decision memo as Markdown (`decisionMemo`): copy or download; it includes the description, the share link does not.
 
 ## Run
@@ -31,7 +31,7 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - `node --check` every JS file. No browser in CI: tests cover the engine, catalog, and static checks.
 
 ## Layout
-- `index.html`, `styles.css`, `app.js`, `catalog.json` at the repo root are the whole app (deploy these four).
+- `index.html`, `styles.css`, `app.js`, `catalog.json` at the repo root are the whole app (deploy these four; the favicon is an inline SVG).
 - `app.js`: pure engine (weights, scoring, cost, staleness, validation, live merge, switch check, robustness, settings links, presets) exported for node, then browser UI.
 - `tools/refresh_catalog.js`: refreshes catalog.json from a saved OpenRouter model list (prices, context, capabilities, cache and batch prices, output limits, dates) and re-embeds it. Never touches editorial fields. Not deployed.
 - `index.html` embeds a copy of `catalog.json` for `file://` use. After editing the catalog run `node tests/sync_embedded_catalog.js`; a test fails if they drift.
