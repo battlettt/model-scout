@@ -627,6 +627,28 @@ test("monthly limit: a link with cap leaves out pricier models, offers to lift i
   });
 });
 
+test("split traffic: pick a cheaper model and a share, see the cost, and the memo carries it", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
+  var copied = null;
+  Object.defineProperty(p.w.navigator, "clipboard", { value: { writeText: function (t) { copied = t; return Promise.resolve(); } }, configurable: true });
+  return settled(p).then(function () {
+    var sel = p.$("route-model");
+    ok(!sel.disabled && sel.options[0].textContent.indexOf("DeepSeek V4.1 Flash") === 0, "first option: " + sel.options[0].textContent);
+    ok(/^Sending 50% of requests to DeepSeek V4\.1 Flash and the rest to Grok 4\.7/.test(p.$("route-readout").textContent), "readout: " + p.$("route-readout").textContent);
+    ok(p.d.querySelectorAll("#route-bars .rb-fill").length === 2, "two bars");
+    p.$("route-share").value = "80"; fire(p, "route-share");
+    ok(p.$("route-share-out").textContent === "80%" && /^Sending 80%/.test(p.$("route-readout").textContent), "share: " + p.$("route-readout").textContent);
+    sel.value = sel.options[1].value; fire(p, "route-model", "change");
+    ok(p.$("route-readout").textContent.indexOf(sel.options[1].textContent.split(" (")[0]) > 0, "model change: " + p.$("route-readout").textContent);
+    p.$("memo-copy").click();
+    return waitFor(function () { return copied; }, "clipboard write");
+  }).then(function () {
+    ok(/## Split traffic\nSending 80%/.test(copied), "memo: " + copied.slice(0, 200));
+    p.$("local-only").checked = true; fire(p, "local-only", "change");
+    ok(p.$("route-model").disabled && /Local only/.test(p.$("route-readout").textContent), "local: " + p.$("route-readout").textContent);
+  });
+});
+
 test("what if: levers show under the pick; apply one, then undo it", function () {
   var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=rag&quality=frontier&speed=any&context=400000&in=60&out=3" });
   var first;

@@ -844,6 +844,31 @@ test("the monthly limit travels in the link as cap, in the memo, as a lever, and
   assert.ok(/Monthly spend limit: \$400 at this volume/.test(memo), memo.slice(0, 600));
 });
 
+section("Split traffic with a cheaper model");
+test("route options are the ranked models cheaper than the top pick, in rank order", function () {
+  var top = mk({ id: "top", quality_tier: 5 }), mid = mk({ id: "mid", quality_tier: 4, input_price_per_mtok: 0.5, output_price_per_mtok: 2 });
+  var same = mk({ id: "same", quality_tier: 3 }), low = mk({ id: "low", quality_tier: 3, input_price_per_mtok: 0.1, output_price_per_mtok: 0.4 });
+  var p = profile(), res = S.rankModels([low, same, mid, top], p, NOW);
+  assert.strictEqual(res.ranked[0].model.id, "top");
+  assert.deepStrictEqual(S.routeOptions(res.ranked, p).map(function (o) { return o.id; }), ["mid", "low"]); // "same" costs the same
+  assert.deepStrictEqual(S.routeOptions(res.ranked, profile({ inputTokens: 0, outputTokens: 0 })), []);
+  assert.deepStrictEqual(S.routeOptions(res.ranked.slice(0, 1), p), []);
+  assert.deepStrictEqual(S.routeOptions(res.ranked, profile({ localOnly: true })), []);
+});
+test("a split prices in proportion to the share and says what it gives up", function () {
+  var top = mk({ id: "top", model: "Big", quality_tier: 5 }), low = mk({ id: "low", model: "Small", quality_tier: 3, input_price_per_mtok: 0.1, output_price_per_mtok: 0.4 });
+  var p = profile(), res = S.rankModels([top, low], p, NOW); // $90 and $9 a month
+  var sp = S.routeSplit(res.ranked, p, "low", 0.7);
+  close(sp.cost, 0.7 * 9 + 0.3 * 90); close(sp.saves, 90 - sp.cost); close(sp.savesPct, sp.saves / 90);
+  assert.ok(/^Sending 70% of requests to Small and the rest to Big costs about \$33\.30 a month instead of \$90\.00, saving \$56\.70 \(63%\)\. Small scores [\d.]+ against [\d.]+ on your profile, [\d.]+ points lower\.$/.test(S.routeText(sp)), S.routeText(sp));
+  assert.strictEqual(S.routeSplit(res.ranked, p, "nope", 0.5).cheap.id, "low", "an unknown id falls back to the first option");
+  assert.strictEqual(S.routeSplit(res.ranked, p, "low", 2).share, 0.95, "share is capped at 95%");
+  assert.ok(/^At 0%, every request goes to Big/.test(S.routeText(S.routeSplit(res.ranked, p, "low", 0))));
+  var md = S.decisionMemo({ res: res, p: p, now: NOW, route: sp });
+  assert.ok(/## Split traffic\nSending 70%/.test(md) && /test the cheaper model on your own examples/.test(md), md);
+  assert.ok(!/## Split traffic/.test(S.decisionMemo({ res: res, p: p, now: NOW, route: S.routeSplit(res.ranked, p, "low", 0) })), "no section at 0%");
+});
+
 section("What if one constraint changed");
 test("lever options change one setting and keep the rest", function () {
   var base = S.presetSettings("coding-agent"), opts = S.leverOptions(base);
