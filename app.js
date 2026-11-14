@@ -1,4 +1,4 @@
-/* Model Scout v1: client-side ranking engine and UI.
+/* Model Scout v2: client-side ranking engine and UI.
    The engine functions are pure and exported for node tests (tests/run_tests.js).
    The UI code only runs in a browser. The ranker calls no model: it fetches catalog.json
    (same folder) and the public OpenRouter model list. Only the "Ask a model" panel calls a
@@ -31,6 +31,12 @@
   var COST_LOG_LO = 0.05; // $/M blended price that scores 1.0
   var COST_LOG_HI = 30;   // $/M blended price that scores 0.0
   var SWITCH_MARGIN = 5;  // points a challenger must win by before switching is worth it
+  var CAPABILITIES = ["tools", "json", "reasoning"];
+  var CAPABILITY_LABELS = { tools: "tool calling", json: "JSON output", reasoning: "reasoning mode" };
+  var MAX_CACHE_SHARE = 0.95;
+  var ROBUST_SAMPLES = 300;
+  var ROBUST_SPREAD = Math.log(2); // each weight is scaled by a factor between 1/2 and 2
+  var DAYS_PER_MONTH = 365 / 12;
 
   // ---------- small helpers ----------
   function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
@@ -38,20 +44,50 @@
   function round(x, d) { var p = Math.pow(10, d || 0); return Math.round(x * p) / p; }
 
   // ---------- cost math ----------
-  /** Monthly cost in USD. Prices are per million tokens. Returns null if a price is unknown. */
-  function monthlyCost(model, inputTokens, outputTokens) {
+  /**
+   * Prices per million tokens after the profile's batch and cache options. Null when a list price is unknown.
+   * opts: { useBatch, cacheShare }. A batch price is used only when it is listed and not higher than the
+   * standard price. Cached input is billed at the cache read price for cacheShare of the input tokens.
+   * The cache discount is not combined with a batch price, and cache write fees are not modelled.
+   */
+  function effectivePrices(model, opts) {
     var pin = model.input_price_per_mtok, pout = model.output_price_per_mtok;
     if (!isNum(pin) || !isNum(pout)) return null;
-    return (inputTokens / 1e6) * pin + (outputTokens / 1e6) * pout;
+    var o = opts || {}, r = { input: pin, output: pout, batch: false, cache: false };
+    var bi = model.batch_input_price_per_mtok, bo = model.batch_output_price_per_mtok;
+    if (o.useBatch && isNum(bi) && isNum(bo) && bi <= pin && bo <= pout) {
+      r.input = bi; r.output = bo; r.batch = true;
+    }
+    var share = isNum(o.cacheShare) ? clamp(o.cacheShare, 0, MAX_CACHE_SHARE) : 0;
+    var cr = model.cache_read_price_per_mtok;
+    if (!r.batch && share > 0 && isNum(cr) && cr < r.input) {
+      r.input = (1 - share) * r.input + share * cr;
+      r.cache = true;
+    }
+    return r;
+  }
+
+  /** Monthly cost in USD. Prices are per million tokens. Returns null if a price is unknown. opts as in effectivePrices. */
+  function monthlyCost(model, inputTokens, outputTokens, opts) {
+    var e = effectivePrices(model, opts);
+    if (!e) return null;
+    return (inputTokens / 1e6) * e.input + (outputTokens / 1e6) * e.output;
   }
 
   /** Blended $/M for the user's input/output mix. Defaults to a 3:1 input:output mix. */
-  function blendedPrice(model, inputTokens, outputTokens) {
-    var pin = model.input_price_per_mtok, pout = model.output_price_per_mtok;
-    if (!isNum(pin) || !isNum(pout)) return null;
+  function blendedPrice(model, inputTokens, outputTokens, opts) {
+    var e = effectivePrices(model, opts);
+    if (!e) return null;
     var i = inputTokens > 0 ? inputTokens : 0, o = outputTokens > 0 ? outputTokens : 0;
     if (i + o === 0) { i = 3; o = 1; }
-    return (i * pin + o * pout) / (i + o);
+    return (i * e.input + o * e.output) / (i + o);
+  }
+
+  /** Monthly volume in millions of tokens from requests per day and tokens per request. A month is 365/12 days. */
+  function volumeFromRequests(perDay, inPerRequest, outPerRequest) {
+    function n(x) { return isNum(x) && x > 0 ? x : 0; }
+    var requests = n(perDay) * DAYS_PER_MONTH;
+    return { requests: requests, inputM: requests * n(inPerRequest) / 1e6, outputM: requests * n(outPerRequest) / 1e6 };
   }
 
   // ---------- staleness ----------
@@ -95,7 +131,27 @@
     if (parseDate(e.last_verified) === null && e.price_status !== "unverified") {
       errs.push("no valid last_verified date and not flagged unverified");
     }
+    // optional fields, filled from OpenRouter's model list when the model is listed there
+    ["cache_read_price_per_mtok", "batch_input_price_per_mtok", "batch_output_price_per_mtok", "max_output_tokens"].forEach(function (f) {
+      if (e[f] != null && (!isNum(e[f]) || e[f] < 0)) errs.push(f + " must be a non-negative number or null");
+    });
+    if ((e.batch_input_price_per_mtok == null) !== (e.batch_output_price_per_mtok == null)) errs.push("batch prices must be both set or both null");
+    if (e.capabilities != null) {
+      if (typeof e.capabilities !== "object" || Array.isArray(e.capabilities)) errs.push("capabilities must be an object or null");
+      else CAPABILITIES.forEach(function (k) { if (typeof e.capabilities[k] !== "boolean") errs.push("capabilities." + k + " must be true or false"); });
+    }
+    if (e.retires_on != null && parseDate(e.retires_on) === null) errs.push("retires_on must be a YYYY-MM-DD date or null");
     return errs;
+  }
+
+  /** Scheduled retirement from the listed expiration date, or null when none is listed. */
+  function retirement(e, now) {
+    var t = parseDate(e && e.retires_on);
+    if (t === null) return null;
+    var nowMs = now instanceof Date ? now.getTime() : (isNum(now) ? now : Date.now());
+    var days = Math.ceil((t - nowMs) / DAY_MS), d = String(e.retires_on).slice(0, 10);
+    if (days < 0) return { days: days, past: true, text: "Retired on " + d + ", the expiration date OpenRouter lists. Move off it." };
+    return { days: days, past: false, text: "Scheduled to retire on " + d + (days === 0 ? " (today)" : " (in " + days + " day" + (days === 1 ? "" : "s") + ")") + ": plan the move now." };
   }
 
   /** Every flag the UI should show for an entry's data quality. */
@@ -103,6 +159,8 @@
     var flags = [];
     var st = staleStatus(e, now);
     if (st.stale) flags.push({ level: "warn", text: "Stale: " + st.reason });
+    var ret = retirement(e, now);
+    if (ret) flags.push({ level: "warn", text: ret.text });
     if (e.price_status === "unverified") flags.push({ level: "warn", text: "Price not verified: the figure shown is not confirmed by a current source." });
     if (e.unverified_fields && e.unverified_fields.length) {
       flags.push({ level: "warn", text: "Not verified: " + e.unverified_fields.join(", ").replace(/_/g, " ") + "." });
@@ -158,6 +216,14 @@
     if (task === "vision" && needMod === "text") needMod = "image";
     if (mods.indexOf(needMod) < 0) return excl(r, "Does not accept " + needMod + " input.");
     if (p.localOnly && !m.open_weights) return excl(r, "Hosted only: no downloadable weights, and your profile is local-only.");
+    if (!isEmbedTask) {
+      for (var ci = 0; ci < CAPABILITIES.length; ci++) {
+        var ck = CAPABILITIES[ci], label = CAPABILITY_LABELS[ck];
+        if (!(p.needs && p.needs[ck])) continue;
+        if (m.capabilities && m.capabilities[ck] === false) return excl(r, "Does not support " + label + " (OpenRouter's model list), and your profile requires it.");
+        if (!m.capabilities) r.flags.push(label.charAt(0).toUpperCase() + label.slice(1) + " not confirmed: no capability data for this model.");
+      }
+    }
 
     var c = r.components;
     // cost
@@ -166,7 +232,7 @@
       c.cost = HARDWARE_SCORE[hw] != null ? HARDWARE_SCORE[hw] : HARDWARE_SCORE.unknown;
       r.notes.push("Self-hosted: needs " + (HARDWARE_LABEL[hw] || HARDWARE_LABEL.unknown) + ". Cost score reflects hardware size, not a per-token price.");
     } else {
-      var b = blendedPrice(m, p.inputTokens, p.outputTokens);
+      var b = blendedPrice(m, p.inputTokens, p.outputTokens, p);
       if (b === null) { c.cost = 0.5; r.flags.push("Price unknown, so cost was scored as average."); }
       else {
         c.cost = costScoreFromPrice(b);
@@ -174,6 +240,7 @@
           c.cost *= 0.25;
           r.flags.push("Over budget: about $" + round(b, 3) + " per million tokens for your mix, above your $" + p.budget + " limit.");
         }
+        costNotes(r, m, p);
       }
     }
     // quality
@@ -219,6 +286,20 @@
 
   function excl(r, reason) { r.excluded = true; r.excludeReason = reason; return r; }
 
+  /** Notes on how the batch and cache options changed this model's price. */
+  function costNotes(r, m, p) {
+    var e = effectivePrices(m, p);
+    if (!e) return;
+    if (p.useBatch) {
+      r.notes.push(e.batch ? "Batch price used: " + fmtPrice(e.input) + " in / " + fmtPrice(e.output) + " out per 1M tokens, for work that can wait for a batch run." :
+        "No lower batch price is listed for this model, so the standard price is used.");
+    }
+    if (isNum(p.cacheShare) && p.cacheShare > 0 && !e.batch) {
+      r.notes.push(e.cache ? "Cached input billed at " + fmtPrice(m.cache_read_price_per_mtok) + " per 1M for " + Math.round(clamp(p.cacheShare, 0, MAX_CACHE_SHARE) * 100) + "% of input tokens. Cache write fees are not included." :
+        "No cache read price is listed, so all input is billed at the full input price.");
+    }
+  }
+
   /** Rank all models. Ties are broken by lower monthly cost, then by name. */
   function rankModels(models, p, now) {
     var w = computeWeights(p);
@@ -226,7 +307,7 @@
     var ranked = all.filter(function (r) { return !r.excluded; });
     ranked.sort(function (a, b) {
       if (b.total !== a.total) return b.total - a.total;
-      var ca = monthlyCost(a.model, p.inputTokens, p.outputTokens), cb = monthlyCost(b.model, p.inputTokens, p.outputTokens);
+      var ca = monthlyCost(a.model, p.inputTokens, p.outputTokens, p), cb = monthlyCost(b.model, p.inputTokens, p.outputTokens, p);
       if (ca !== cb) return (ca === null ? Infinity : ca) - (cb === null ? Infinity : cb);
       return a.model.model.localeCompare(b.model.model);
     });
@@ -258,7 +339,7 @@
     if (bads.length) trade.push("You accept " + bads.slice(0, 2).join(" and ") + ".");
     var other = r === top ? second : top;
     if (other) {
-      var mc = monthlyCost(r.model, p.inputTokens, p.outputTokens), oc = monthlyCost(other.model, p.inputTokens, p.outputTokens);
+      var mc = monthlyCost(r.model, p.inputTokens, p.outputTokens, p), oc = monthlyCost(other.model, p.inputTokens, p.outputTokens, p);
       var name = other.model.model;
       if (!p.localOnly && mc !== null && oc !== null && (p.inputTokens + p.outputTokens) > 0 && Math.abs(mc - oc) >= 0.01) {
         trade.push(mc > oc ? "Costs " + fmtMoney(mc - oc) + " more per month than " + name + "." :
@@ -290,12 +371,98 @@
     return {
       found: true, excluded: false, current: cur, better: better,
       worthSwitching: better.length > 0 && better[0].margin >= SWITCH_MARGIN,
-      stale: staleStatus(cur.model, now)
+      stale: staleStatus(cur.model, now), retirement: retirement(cur.model, now)
+    };
+  }
+
+  // ---------- robustness of the top pick ----------
+  /** Small seeded random number generator (mulberry32), so the same profile always gives the same answer. */
+  function seededRandom(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /**
+   * How often does each model come first when the weights are nudged at random? Each sample scales every
+   * weight by a factor between 1/2 and 2, renormalises, and rescores every ranked model with the same
+   * factor scores. Ties go to the higher-ranked model. Returns null when nothing is ranked.
+   * runnerUp says whether the second model ties the top pick on every factor (no weighting can separate
+   * them) or is matched or beaten on every factor (no weighting can put it first).
+   */
+  function robustness(res, opts) {
+    opts = opts || {};
+    var ranked = res && res.ranked;
+    if (!ranked || !ranked.length) return null;
+    var n = opts.samples || ROBUST_SAMPLES, spread = isNum(opts.spread) ? opts.spread : ROBUST_SPREAD;
+    var w = res.weights, keys = Object.keys(w), rnd = seededRandom(opts.seed || 20261113);
+    var wins = ranked.map(function () { return 0; });
+    for (var s = 0; s < n; s++) {
+      var ws = {}, sum = 0;
+      keys.forEach(function (k) { ws[k] = w[k] * Math.exp(spread * (2 * rnd() - 1)); sum += ws[k]; });
+      var best = 0, bestV = -Infinity;
+      for (var i = 0; i < ranked.length; i++) {
+        var r = ranked[i], v = 0;
+        for (var j = 0; j < keys.length; j++) v += (ws[keys[j]] / sum) * r.components[keys[j]];
+        v *= r.fit;
+        if (v > bestV + 1e-12) { bestV = v; best = i; }
+      }
+      wins[best]++;
+    }
+    var shares = ranked.map(function (r, i) { return { model: r.model, rank: r.rank, share: wins[i] / n }; })
+      .filter(function (x) { return x.share > 0; })
+      .sort(function (a, b) { return b.share - a.share || a.rank - b.rank; });
+    var topShare = wins[0] / n, runnerUp = null;
+    if (ranked[1]) {
+      var a = ranked[0], b = ranked[1], ge = true, eq = true;
+      keys.forEach(function (k) {
+        var x = a.components[k] * a.fit, y = b.components[k] * b.fit;
+        if (x < y - 1e-9) ge = false;
+        if (Math.abs(x - y) > 1e-9) eq = false;
+      });
+      runnerUp = { model: b.model, twin: eq, dominated: ge && !eq };
+    }
+    return {
+      samples: n, topShare: topShare, shares: shares, runnerUp: runnerUp,
+      verdict: runnerUp && runnerUp.twin ? "tie" : topShare >= 0.8 ? "stable" : topShare >= 0.5 ? "likely" : "close"
     };
   }
 
   // ---------- live data (OpenRouter) ----------
   function perMillion(x) { var v = parseFloat(x); return isFinite(v) ? round(v * 1e6, 4) : null; }
+
+  /**
+   * Facts beyond price from one OpenRouter list entry: capabilities (from supported_parameters), cache read
+   * price, batch prices (from the ":batch" variant), output limit, retirement date, and listing date.
+   * Every key is present; null means OpenRouter does not list it.
+   */
+  function liveFacts(m, byId) {
+    var f = { capabilities: null, cache_read_price_per_mtok: null, batch_input_price_per_mtok: null,
+      batch_output_price_per_mtok: null, max_output_tokens: null, retires_on: null, listed_on: null };
+    if (!m) return f;
+    var sp = Array.isArray(m.supported_parameters) ? m.supported_parameters : null;
+    if (sp) {
+      f.capabilities = { tools: sp.indexOf("tools") >= 0,
+        json: sp.indexOf("structured_outputs") >= 0 || sp.indexOf("response_format") >= 0,
+        reasoning: sp.indexOf("reasoning") >= 0 || sp.indexOf("include_reasoning") >= 0 };
+    }
+    var cr = perMillion(m.pricing && m.pricing.input_cache_read);
+    if (cr !== null && cr >= 0) f.cache_read_price_per_mtok = cr;
+    var b = byId && byId[m.id + ":batch"];
+    if (b && b.pricing) {
+      var bi = perMillion(b.pricing.prompt), bo = perMillion(b.pricing.completion);
+      if (bi !== null && bo !== null && bi >= 0 && bo >= 0) { f.batch_input_price_per_mtok = bi; f.batch_output_price_per_mtok = bo; }
+    }
+    var tp = m.top_provider || {};
+    if (isNum(tp.max_completion_tokens) && tp.max_completion_tokens > 0) f.max_output_tokens = tp.max_completion_tokens;
+    if (typeof m.expiration_date === "string" && parseDate(m.expiration_date) !== null) f.retires_on = m.expiration_date.slice(0, 10);
+    if (isNum(m.created) && m.created > 0) f.listed_on = new Date(m.created * 1000).toISOString().slice(0, 10);
+    return f;
+  }
 
   /** Merge OpenRouter data into the catalog. Returns { models, matched, changed, liveOnly }. */
   function mergeLive(catalogModels, orData, fetchedAt) {
@@ -317,6 +484,8 @@
       copy.input_price_per_mtok = pin;
       copy.output_price_per_mtok = pout;
       if (isNum(live.context_length)) copy.context_window = live.context_length;
+      var facts = liveFacts(live, byId);
+      Object.keys(facts).forEach(function (k) { copy[k] = facts[k]; });
       copy.price_status = "live";
       copy.last_verified = stamp;
       copy.live = { fetchedAt: stamp, changes: diffs };
@@ -335,7 +504,7 @@
       var pin = perMillion(m.pricing && m.pricing.prompt), pout = perMillion(m.pricing && m.pricing.completion);
       if (pin === null || pout === null || pin < 0 || pout < 0) return;
       var provider = id.split("/")[0];
-      liveOnly.push({
+      var entry = {
         id: "live:" + id, model: String(m.name || id).split(": ").pop(), provider: provider, kind: "generation",
         openrouter_id: id, context_window: isNum(m.context_length) ? m.context_length : null,
         input_price_per_mtok: pin, output_price_per_mtok: pout, price_status: "live", unverified_fields: [],
@@ -345,7 +514,10 @@
         strengths: ["Listed live on OpenRouter"], limits: ["Not reviewed by Model Scout: quality and speed are not rated"],
         source: { name: "OpenRouter live model list, fetched " + stamp, url: "https://openrouter.ai/" + id },
         last_verified: stamp, live: { fetchedAt: stamp, changes: [] }, liveOnly: true
-      });
+      };
+      var lf = liveFacts(m, byId);
+      Object.keys(lf).forEach(function (k) { entry[k] = lf[k]; });
+      liveOnly.push(entry);
     });
     return { models: merged, matched: matched, changed: changed, liveOnly: liveOnly };
   }
@@ -368,7 +540,118 @@
     if (has(/\b(real-time|realtime|fast|instant|latency|live chat)\b/)) { s.latency = "fast"; why.push("mentions speed"); }
     if (has(/\b(hardest|frontier|best possible|research|complex reasoning|math proof|critical)\b/)) { s.quality = "frontier"; why.push("mentions top quality"); }
     if (has(/\b(long document|long documents|entire codebase|whole codebase|books?|contracts|transcripts|hundreds of pages)\b/)) { s.contextNeed = 400000; why.push("mentions long inputs"); }
+    if (s.taskType === "agentic" || has(/\b(function calling|tool calls?|call (our|an|the) api)\b/)) { s.tools = true; why.push("needs tool calling"); }
+    if (has(/\b(json|structured output|schema|extract fields)\b/)) { s.json = true; why.push("mentions JSON or structured output"); }
+    if (has(/\b(overnight|nightly|batch|backfill)\b/)) { s.useBatch = true; s.latency = "any"; why.push("mentions batch or overnight work"); }
     return { settings: s, why: why };
+  }
+
+  // ---------- profile settings: presets and shareable links ----------
+  // Settings are what the form shows (volumes in millions, cache share as a fraction). profileFromSettings
+  // turns them into the profile the engine scores against.
+  var DEFAULT_SETTINGS = {
+    taskType: "chat", modality: "text", quality: "good", latency: "balanced", contextNeed: 32000, budget: null,
+    localOnly: false, inputM: 50, outputM: 10, cacheShare: 0, useBatch: false, tools: false, json: false, reasoning: false
+  };
+  var SETTING_CHOICES = {
+    taskType: ["chat", "code", "rag", "vision", "embeddings", "agentic"],
+    modality: ["text", "image", "file", "audio", "video"],
+    quality: ["basic", "good", "frontier"],
+    latency: ["balanced", "fast", "any"],
+    contextNeed: [8000, 32000, 128000, 200000, 400000, 1000000, 2000000],
+    cacheShare: [0, 0.25, 0.5, 0.75, 0.9]
+  };
+  var BOOL_SETTINGS = ["localOnly", "useBatch", "tools", "json", "reasoning"];
+  var URL_KEYS = {
+    taskType: "task", modality: "input", quality: "quality", latency: "speed", contextNeed: "context", budget: "budget",
+    localOnly: "local", inputM: "in", outputM: "out", cacheShare: "cache", useBatch: "batch", tools: "tools", json: "json", reasoning: "reasoning"
+  };
+  var PRESETS = [
+    { id: "support", name: "Support bot", description: "Answer customer questions from our help center articles, quickly, at high volume",
+      settings: { taskType: "rag", latency: "fast", budget: 1, inputM: 300, outputM: 30, cacheShare: 0.5 } },
+    { id: "coding-agent", name: "Coding agent", description: "An agent that reads a repository, calls tools, runs the tests, and opens pull requests",
+      settings: { taskType: "agentic", quality: "frontier", contextNeed: 200000, inputM: 200, outputM: 10, cacheShare: 0.75, tools: true } },
+    { id: "bulk", name: "Bulk tagging", description: "Tag a million product reviews a month by topic and sentiment, returned as JSON, overnight",
+      settings: { quality: "basic", latency: "any", contextNeed: 8000, budget: 0.5, inputM: 400, outputM: 20, useBatch: true, json: true } },
+    { id: "contracts", name: "Contract review", description: "Read whole contracts and flag unusual clauses for a lawyer to check",
+      settings: { taskType: "rag", quality: "frontier", latency: "any", contextNeed: 400000, inputM: 60, outputM: 3 } },
+    { id: "private", name: "On our own servers", description: "Summarise confidential internal documents without the data leaving our machines",
+      settings: { localOnly: true, inputM: 20, outputM: 4 } },
+    { id: "screens", name: "Read scans", description: "Pull fields out of scanned invoices and screenshots as JSON",
+      settings: { taskType: "vision", modality: "image", inputM: 40, outputM: 4, json: true } },
+    { id: "search", name: "Semantic search", description: "Embed our document library so people can search it by meaning",
+      settings: { taskType: "embeddings", contextNeed: 8000, inputM: 500, outputM: 0 } }
+  ];
+
+  function withDefaults(s) {
+    var out = {};
+    Object.keys(DEFAULT_SETTINGS).forEach(function (k) { out[k] = s && s[k] !== undefined ? s[k] : DEFAULT_SETTINGS[k]; });
+    return out;
+  }
+
+  /** Full settings for a preset id, or null for an unknown id. */
+  function presetSettings(id) {
+    for (var i = 0; i < PRESETS.length; i++) if (PRESETS[i].id === id) return withDefaults(PRESETS[i].settings);
+    return null;
+  }
+
+  /** The engine's profile from form settings. */
+  function profileFromSettings(s) {
+    var f = withDefaults(s);
+    function tok(m) { return isNum(m) && m > 0 ? m * 1e6 : 0; }
+    return {
+      taskType: f.taskType, modality: f.modality, quality: f.quality, latency: f.latency,
+      contextNeed: isNum(f.contextNeed) ? f.contextNeed : 0, budget: isNum(f.budget) && f.budget > 0 ? f.budget : null,
+      localOnly: !!f.localOnly, inputTokens: tok(f.inputM), outputTokens: tok(f.outputM),
+      cacheShare: isNum(f.cacheShare) ? clamp(f.cacheShare, 0, MAX_CACHE_SHARE) : 0, useBatch: !!f.useBatch,
+      needs: { tools: !!f.tools, json: !!f.json, reasoning: !!f.reasoning }
+    };
+  }
+
+  /** Settings as a query string, so a ranking can be shared as a link. Defaults are left out. The task description is never included. */
+  function encodeSettings(s) {
+    var f = withDefaults(s), parts = [];
+    Object.keys(URL_KEYS).forEach(function (k) {
+      var v = f[k];
+      if (v === DEFAULT_SETTINGS[k] || v === null || v === undefined) return;
+      if (k === "cacheShare") v = Math.round(v * 100);
+      if (v === true) v = 1;
+      if (v === false) v = 0;
+      parts.push(URL_KEYS[k] + "=" + encodeURIComponent(String(v)));
+    });
+    return parts.join("&");
+  }
+
+  function parseSetting(k, raw) {
+    var x;
+    if (k === "contextNeed") { x = Number(raw); return SETTING_CHOICES.contextNeed.indexOf(x) >= 0 ? x : undefined; }
+    if (k === "cacheShare") { x = Number(raw) / 100; return SETTING_CHOICES.cacheShare.indexOf(x) >= 0 ? x : undefined; }
+    if (SETTING_CHOICES[k]) return SETTING_CHOICES[k].indexOf(raw) >= 0 ? raw : undefined;
+    if (BOOL_SETTINGS.indexOf(k) >= 0) return raw === "1" ? true : raw === "0" ? false : undefined;
+    if (raw === "" || !/^\d*\.?\d+$/.test(raw)) return undefined;
+    x = Number(raw);
+    if (k === "budget") return x > 0 && x <= 1000 ? x : undefined;
+    if (k === "inputM" || k === "outputM") return x >= 0 && x <= 1e6 ? x : undefined;
+    return undefined;
+  }
+
+  /** Settings from a query string. Unknown keys and invalid values are skipped and listed in ignored. */
+  function decodeSettings(qs) {
+    var settings = {}, ignored = [], rev = {};
+    Object.keys(URL_KEYS).forEach(function (k) { rev[URL_KEYS[k]] = k; });
+    String(qs || "").replace(/^\?/, "").split("&").forEach(function (pair) {
+      if (!pair) return;
+      var i = pair.indexOf("="), key, raw;
+      try {
+        key = decodeURIComponent(i < 0 ? pair : pair.slice(0, i));
+        raw = i < 0 ? "" : decodeURIComponent(pair.slice(i + 1).replace(/\+/g, " "));
+      } catch (e) { ignored.push(pair); return; }
+      var k = rev[key];
+      if (!k) { ignored.push(key); return; }
+      var v = parseSetting(k, raw);
+      if (v === undefined) ignored.push(key); else settings[k] = v;
+    });
+    return { settings: settings, ignored: ignored };
   }
 
   // ---------- formatting ----------
@@ -667,6 +950,10 @@
     dataFlags: dataFlags, computeWeights: computeWeights, scoreModel: scoreModel, rankModels: rankModels,
     switchCheck: switchCheck, mergeLive: mergeLive, suggestFromText: suggestFromText, costScoreFromPrice: costScoreFromPrice,
     fmtMoney: fmtMoney, fmtTokens: fmtTokens,
+    CAPABILITIES: CAPABILITIES, DEFAULT_SETTINGS: DEFAULT_SETTINGS, PRESETS: PRESETS,
+    effectivePrices: effectivePrices, volumeFromRequests: volumeFromRequests, retirement: retirement, liveFacts: liveFacts, perMillion: perMillion,
+    robustness: robustness, presetSettings: presetSettings, profileFromSettings: profileFromSettings,
+    encodeSettings: encodeSettings, decodeSettings: decodeSettings,
     OPENROUTER_CHAT_URL: OPENROUTER_CHAT_URL, OLLAMA_CHAT_URL: OLLAMA_CHAT_URL, LOCAL_MODEL: LOCAL_MODEL,
     DEFAULT_CHAT_MODEL: DEFAULT_CHAT_MODEL, FEATURED_CHAT_MODELS: FEATURED_CHAT_MODELS, KEY_STORAGE: KEY_STORAGE,
     buildChatRequest: buildChatRequest, chatText: chatText, httpErrorText: httpErrorText, localModeCheck: localModeCheck,
@@ -679,7 +966,9 @@
   // =====================================================================
   // Browser UI
   // =====================================================================
-  var state = { catalog: null, catalogOrigin: "", base: [], liveOnly: [], live: null, liveIds: null, now: new Date(), lastOrder: null };
+  var CARD_LIMIT = 6;
+  var state = { catalog: null, catalogOrigin: "", base: [], liveOnly: [], live: null, liveIds: null, now: new Date(), lastOrder: null,
+    touched: false, showAllCards: false, linkNote: "" };
 
   function $(id) { return document.getElementById(id); }
   function esc(s) {
@@ -689,22 +978,36 @@
   }
   function safeUrl(u) { return /^https:\/\//.test(String(u || "")) ? u : "#"; }
 
-  function readProfile() {
+  var CHECK_IDS = { localOnly: "local-only", useBatch: "use-batch", tools: "need-tools", json: "need-json", reasoning: "need-reasoning" };
+  var SELECT_IDS = { taskType: "task-type", modality: "modality", quality: "quality", latency: "latency", contextNeed: "context-need", cacheShare: "cache-share" };
+
+  /** What the form shows, as settings (volumes in millions). */
+  function readSettings() {
     var budgetRaw = $("budget").value.trim();
     var budget = budgetRaw === "" ? null : parseFloat(budgetRaw);
-    function tokens(id) { var v = parseFloat($(id).value); return isFinite(v) && v > 0 ? v * 1e6 : 0; }
-    return {
-      description: $("task-desc").value,
-      taskType: $("task-type").value,
-      budget: isFinite(budget) && budget > 0 ? budget : null,
-      latency: $("latency").value,
-      quality: $("quality").value,
-      localOnly: $("local-only").checked,
-      contextNeed: parseInt($("context-need").value, 10) || 0,
-      modality: $("modality").value,
-      inputTokens: tokens("vol-in"),
-      outputTokens: tokens("vol-out")
+    function num(id) { var v = parseFloat($(id).value); return isFinite(v) && v > 0 ? v : 0; }
+    var s = {
+      taskType: $("task-type").value, modality: $("modality").value, quality: $("quality").value, latency: $("latency").value,
+      contextNeed: parseInt($("context-need").value, 10) || 0, budget: isFinite(budget) && budget > 0 ? budget : null,
+      inputM: num("vol-in"), outputM: num("vol-out"), cacheShare: parseFloat($("cache-share").value) || 0
     };
+    Object.keys(CHECK_IDS).forEach(function (k) { s[k] = $(CHECK_IDS[k]).checked; });
+    return s;
+  }
+
+  /** Put settings into the form. Only the keys present change. */
+  function applySettings(s) {
+    Object.keys(SELECT_IDS).forEach(function (k) { if (k in s) $(SELECT_IDS[k]).value = String(s[k]); });
+    Object.keys(CHECK_IDS).forEach(function (k) { if (k in s) $(CHECK_IDS[k]).checked = !!s[k]; });
+    if ("budget" in s) $("budget").value = s.budget == null ? "" : String(s.budget);
+    if ("inputM" in s) $("vol-in").value = String(s.inputM);
+    if ("outputM" in s) $("vol-out").value = String(s.outputM);
+  }
+
+  function readProfile() {
+    var p = profileFromSettings(readSettings());
+    p.description = $("task-desc").value;
+    return p;
   }
 
   function candidates() {
@@ -736,18 +1039,84 @@
   }
 
   function costCell(r, p) {
-    var mc = monthlyCost(r.model, p.inputTokens, p.outputTokens);
+    var mc = monthlyCost(r.model, p.inputTokens, p.outputTokens, p);
     if (p.localOnly) return "Self-hosted<br><small>hosted reference " + esc(fmtMoney(mc)) + "</small>";
     return esc(fmtMoney(mc));
   }
 
+  /** Which discounts the monthly figure includes, as a short note. */
+  function costBasis(m, p) {
+    var e = effectivePrices(m, p), bits = [];
+    if (!e) return "";
+    if (e.batch) bits.push("at batch prices");
+    if (e.cache) bits.push("with " + Math.round(p.cacheShare * 100) + "% of input cached");
+    return bits.length ? ", " + bits.join(", ") : "";
+  }
+
   /** Large monthly cost readout for the top pick and the model cards. */
   function costFigure(r, p) {
-    var mc = monthlyCost(r.model, p.inputTokens, p.outputTokens);
+    var mc = monthlyCost(r.model, p.inputTokens, p.outputTokens, p);
     if (p.localOnly) {
       return '<span class="figure-value cost">Self-hosted<span class="unit">hosted reference ' + esc(fmtMoney(mc)) + " per month</span></span>";
     }
-    return '<span class="figure-value cost">' + esc(fmtMoney(mc)) + '<span class="unit">per month at your volume</span></span>';
+    return '<span class="figure-value cost">' + esc(fmtMoney(mc)) + '<span class="unit">per month at your volume' + esc(costBasis(r.model, p)) + "</span></span>";
+  }
+
+  /** Capabilities and limits from OpenRouter's list, as one sentence for a card. */
+  function capsText(m) {
+    if (m.kind === "embedding") return "";
+    if (!m.capabilities) return "Capabilities: no data (not listed on OpenRouter).";
+    var yes = CAPABILITIES.filter(function (k) { return m.capabilities[k]; }).map(function (k) { return CAPABILITY_LABELS[k]; });
+    var no = CAPABILITIES.filter(function (k) { return !m.capabilities[k]; }).map(function (k) { return CAPABILITY_LABELS[k]; });
+    var t = yes.length ? "Supports " + yes.join(", ") + "." : "Lists none of tool calling, JSON output, or reasoning mode.";
+    if (yes.length && no.length) t += " Not listed: " + no.join(", ") + ".";
+    if (isNum(m.max_output_tokens)) t += " Longest answer: " + fmtTokens(m.max_output_tokens) + " tokens.";
+    return t;
+  }
+
+  /** Cache and batch prices, when listed. */
+  function extraPricesText(m) {
+    var bits = [];
+    if (isNum(m.cache_read_price_per_mtok)) bits.push("cache read " + fmtPrice(m.cache_read_price_per_mtok) + " per 1M");
+    if (isNum(m.batch_input_price_per_mtok)) bits.push("batch " + fmtPrice(m.batch_input_price_per_mtok) + " in / " + fmtPrice(m.batch_output_price_per_mtok) + " out per 1M");
+    return bits.length ? "Other listed prices: " + bits.join("; ") + "." : "";
+  }
+
+  var CONFIDENCE_LABEL = { stable: "Stable pick", likely: "Likely pick", close: "Close call", tie: "Tie" };
+
+  /** A share of reruns as a percentage that never rounds a rare win down to 0% or a near sweep up to 100%. */
+  function fmtShare(x) {
+    if (x >= 1) return "100%";
+    if (x > 0.995) return "over 99%";
+    if (x > 0 && x < 0.005) return "under 1%";
+    return pct(x) + "%";
+  }
+
+  /** The robustness check under the top pick: a verdict, one sentence, and a bar of who wins how often. */
+  function confidenceHtml(rb, top) {
+    if (!rb) return "";
+    var ru = rb.runnerUp, n = rb.samples, text;
+    var rivals = rb.shares.filter(function (s) { return s.model.id !== top.model.id; });
+    if (rb.verdict === "tie") {
+      text = "Ties " + ru.model.model + " on every factor, so no weighting separates them. It is listed first only because it costs less per month, or sorts first by name.";
+    } else {
+      text = "Stays first in " + fmtShare(rb.topShare) + " of " + n + " reruns, with each factor's weight scaled at random between half and double.";
+      if (rivals.length) text += " Most frequent rival: " + rivals[0].model.model + " (" + fmtShare(rivals[0].share) + ").";
+      else text += " No rival comes first in any rerun.";
+      if (ru && ru.dominated) text += " It matches or beats " + ru.model.model + " on every factor.";
+    }
+    var segs = rb.shares.slice(0, 5).map(function (s) {
+      var me = s.model.id === top.model.id;
+      return '<span class="conf-seg' + (me ? " is-top" : "") + '" style="flex-grow:' + Math.max(s.share, 0.01).toFixed(3) + '" title="' + esc(s.model.model + ": " + fmtShare(s.share)) + '"></span>';
+    }).join("");
+    var legend = rb.shares.slice(0, 3).map(function (s) {
+      return "<li" + (s.model.id === top.model.id ? ' class="is-top"' : "") + "><span>" + esc(s.model.model) + "</span><span>" + fmtShare(s.share) + "</span></li>";
+    }).join("");
+    return '<div class="confidence" data-verdict="' + rb.verdict + '">' +
+      '<p class="conf-head"><span class="figure-label">Confidence</span><span class="conf-verdict">' + CONFIDENCE_LABEL[rb.verdict] + "</span></p>" +
+      (rb.verdict === "tie" ? "" : '<div class="conf-bar" aria-hidden="true">' + segs + "</div>" +
+        '<ul class="conf-legend" aria-label="Share of reruns each model wins">' + legend + "</ul>") +
+      '<p class="conf-text">' + esc(text) + "</p></div>";
   }
 
   var BEST_FLAG = '<span class="best-flag"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 1.5l1.9 4.1 4.5.5-3.4 3 1 4.4L8 11.3 4 13.5l1-4.4-3.4-3 4.5-.5z"/></svg>Best pick</span>';
@@ -803,6 +1172,7 @@
         "</div>" +
         '<p class="reason"><strong>Why:</strong> ' + esc(top.explain.why) + "</p>" +
         '<p class="reason"><strong>What you trade away:</strong> ' + esc(top.explain.tradeoffs) + "</p>" +
+        confidenceHtml(robustness(res), top) +
         flagList(tf.map(function (f) { return '<li class="' + f.level + '">' + esc(f.text) + "</li>"; })) +
         flagList(top.flags.map(function (f) { return '<li class="warn">' + esc(f) + "</li>"; }));
     }
@@ -849,6 +1219,8 @@
         ". Context: " + esc(fmtTokens(m.context_window)) + ". Speed: " + esc(m.latency_class || "not rated") +
         ". Quality tier: " + (m.quality_tier != null ? m.quality_tier + " of 5 (editorial)" : "not rated") +
         ". Open weights: " + (m.open_weights ? "yes" : "no") + ". Monthly: " + costCell(r, p) + ".</p>" +
+        (capsText(m) ? '<p class="facts">' + esc(capsText(m)) + "</p>" : "") +
+        (extraPricesText(m) ? '<p class="facts">' + esc(extraPricesText(m)) + "</p>" : "") +
         (m.strengths.length ? '<p class="facts"><strong>Strengths:</strong> ' + esc(m.strengths.join("; ")) + ".</p>" : "") +
         (m.limits.length ? '<p class="facts"><strong>Limits:</strong> ' + esc(m.limits.join("; ")) + ".</p>" : "") +
         flagList(flags) +
@@ -856,6 +1228,7 @@
         askButton(m) +
         "</article>";
     }).join("") : '<p class="cards-empty">No model cards to show: every candidate failed a hard constraint. Loosen one in the profile above.</p>';
+    applyCardLimit();
 
     // excluded
     $("excluded").innerHTML = res.excluded.length ? res.excluded.map(function (r) {
@@ -864,6 +1237,92 @@
 
     renderSwitchOptions();
     renderSwitch();
+    syncUrl();
+  }
+
+  /** Only the first CARD_LIMIT cards show until the reader asks for all of them. */
+  function applyCardLimit() {
+    var list = $("cards").querySelectorAll(".card"), btn = $("cards-toggle"), extra = list.length - CARD_LIMIT;
+    Array.prototype.forEach.call(list, function (c, i) { c.hidden = !state.showAllCards && i >= CARD_LIMIT; });
+    btn.hidden = extra <= 0;
+    btn.setAttribute("aria-expanded", state.showAllCards ? "true" : "false");
+    btn.textContent = state.showAllCards ? "Show only the top " + CARD_LIMIT : "Show all " + list.length + " model cards";
+    $("cards-lede").textContent = extra > 0 && !state.showAllCards ?
+      "The top " + CARD_LIMIT + " of " + list.length + " ranked models, with their reasons, trade-offs, capabilities, source, and data status. Every model is in the table above." :
+      "Every ranked model, with its reasons, trade-offs, capabilities, source, and data status.";
+  }
+
+  /** Keep the page address in step with the settings once the reader has changed something, so it can be shared. */
+  function syncUrl() {
+    if (!state.touched || !window.history || typeof history.replaceState !== "function") return;
+    var qs = encodeSettings(readSettings());
+    try { history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + location.hash); } catch (e) { /* file:// in some browsers */ }
+  }
+
+  function shareUrl() {
+    var qs = encodeSettings(readSettings());
+    return location.href.split(/[?#]/)[0] + (qs ? "?" + qs : "") + "#results";
+  }
+
+  function copyShareLink() {
+    var url = shareUrl(), out = $("share-status");
+    function done(ok) {
+      out.textContent = ok ? "Link copied. It holds your settings, not your description." : "Copy this link by hand: " + url;
+    }
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard.writeText(url).then(function () { done(true); }, function () { done(false); });
+    } else done(false);
+  }
+
+  // ----- presets and the volume helper -----
+  function renderPresets() {
+    $("preset-list").innerHTML = PRESETS.map(function (pr) {
+      return '<button type="button" class="preset" data-preset="' + esc(pr.id) + '" aria-pressed="false">' + esc(pr.name) + "</button>";
+    }).join("");
+    $("presets").hidden = false;
+  }
+
+  function markPreset(id) {
+    Array.prototype.forEach.call($("preset-list").querySelectorAll(".preset"), function (b) {
+      b.setAttribute("aria-pressed", b.getAttribute("data-preset") === id ? "true" : "false");
+    });
+  }
+
+  function usePreset(id) {
+    var s = presetSettings(id), pr = PRESETS.filter(function (x) { return x.id === id; })[0];
+    if (!s || !pr) return;
+    applySettings(s);
+    $("task-desc").value = pr.description;
+    markPreset(id);
+    $("preset-result").textContent = "Loaded " + pr.name + ": every field below now matches that case. Volumes are examples, so set your own.";
+    $("suggest-result").textContent = "";
+    state.touched = true;
+    render();
+  }
+
+  function helperVolume() {
+    function v(id) { var x = parseFloat($(id).value); return isFinite(x) && x > 0 ? x : 0; }
+    var d = v("req-day"), i = v("req-in"), o = v("req-out");
+    return { ready: d > 0 && (i > 0 || o > 0), vol: volumeFromRequests(d, i, o) };
+  }
+
+  function fmtMillions(x) { return String(x >= 100 ? Math.round(x) : x >= 1 ? round(x, 2) : Math.max(round(x, 4), x > 0 ? 0.0001 : 0)); }
+
+  function renderHelper() {
+    var h = helperVolume(), out = $("req-readout");
+    $("req-apply").disabled = !h.ready;
+    out.textContent = !h.ready ? "Fill in the three numbers to see the monthly volume." :
+      "About " + Math.round(h.vol.requests).toLocaleString("en-US") + " requests a month: " + fmtMillions(h.vol.inputM) +
+      " million input and " + fmtMillions(h.vol.outputM) + " million output tokens.";
+  }
+
+  function applyHelper() {
+    var h = helperVolume();
+    if (!h.ready) return;
+    applySettings({ inputM: Number(fmtMillions(h.vol.inputM)), outputM: Number(fmtMillions(h.vol.outputM)) });
+    $("req-readout").textContent += " Copied into the volume fields.";
+    state.touched = true;
+    render();
   }
 
   function renderSwitchOptions() {
@@ -895,13 +1354,14 @@
       }).join("") + "</ol>";
     }
     if (r.stale && r.stale.stale) html += '<p class="verdict warn">Spec warning: ' + esc(r.stale.reason) + " Re-check its pricing page before trusting this comparison.</p>";
+    if (r.retirement) html += '<p class="verdict warn">' + esc(r.retirement.text) + "</p>";
     out.innerHTML = html;
   }
 
   function renderStatus() {
     var c = state.catalog, st = staleStatus({ last_verified: c.catalog_date }, state.now, c.stale_after_days);
     var html = '<p><strong>Bundled catalog dated ' + esc(c.catalog_date) + "</strong> (" + state.base.length + " models, " +
-      (st.ageDays != null ? st.ageDays + " days old" : "age unknown") + ", loaded from " + esc(state.catalogOrigin) + "). ";
+      (st.ageDays != null ? st.ageDays + (st.ageDays === 1 ? " day old" : " days old") : "age unknown") + ", loaded from " + esc(state.catalogOrigin) + "). ";
     if (st.stale) html += '<span class="badge stale">Stale</span> This catalog is older than ' + c.stale_after_days + " days. Treat prices as possibly out of date. ";
     html += "</p>";
     var L = state.live;
@@ -925,15 +1385,10 @@
     var s = suggestFromText($("task-desc").value);
     var out = $("suggest-result");
     if (!s.why.length) { out.textContent = "No keywords matched. Set the fields below by hand."; return; }
-    var st = s.settings;
-    if (st.taskType) $("task-type").value = st.taskType;
-    if (st.modality) $("modality").value = st.modality;
-    if (st.localOnly) $("local-only").checked = true;
-    if (st.budget) $("budget").value = st.budget;
-    if (st.latency) $("latency").value = st.latency;
-    if (st.quality) $("quality").value = st.quality;
-    if (st.contextNeed) $("context-need").value = String(st.contextNeed);
+    applySettings(s.settings);
+    markPreset("");
     out.textContent = "Updated settings because your description " + s.why.join(", ") + ". This is simple keyword matching: check the fields.";
+    state.touched = true;
     render();
   }
 
@@ -1310,14 +1765,50 @@
     renderChatLog();
   }
 
+  /** Settings from the page address (a shared link). Unknown or invalid ones are skipped and reported. */
+  function settingsFromUrl() {
+    var d = decodeSettings(location.search);
+    if (Object.keys(d.settings).length) applySettings(d.settings);
+    if (d.ignored.length) $("share-status").textContent = "This link had settings Model Scout could not read, so they were skipped: " + d.ignored.join(", ") + ".";
+    else if (Object.keys(d.settings).length) $("share-status").textContent = "Settings loaded from the link.";
+  }
+
   function init() {
     var form = $("profile");
-    form.addEventListener("input", render);
-    form.addEventListener("change", render);
+    function edited(e) {
+      var id = e && e.target && e.target.id;
+      if (id && /^req-/.test(id)) { renderHelper(); return; } // the volume helper only fills the fields when asked
+      state.touched = true;
+      if (e && e.type === "input" && id !== "task-desc") markPreset("");
+      render();
+    }
+    form.addEventListener("input", edited);
+    form.addEventListener("change", edited);
     form.addEventListener("submit", function (e) { e.preventDefault(); render(); });
     $("suggest").addEventListener("click", applySuggestions);
     $("include-live").addEventListener("change", render);
     $("current-model").addEventListener("change", renderSwitch);
+    $("preset-list").addEventListener("click", function (e) {
+      var b = e.target && e.target.closest ? e.target.closest(".preset") : null;
+      if (b) usePreset(b.getAttribute("data-preset"));
+    });
+    $("req-apply").addEventListener("click", applyHelper);
+    $("share-link").addEventListener("click", copyShareLink);
+    $("cards-toggle").addEventListener("click", function () {
+      state.showAllCards = !state.showAllCards;
+      applyCardLimit();
+      if (!state.showAllCards) $("cards-toggle").scrollIntoView({ block: "nearest" });
+    });
+    // A table link to a card that is folded away opens every card first, so the jump lands.
+    $("compare-body").addEventListener("click", function (e) {
+      var a = e.target && e.target.closest ? e.target.closest('a[href^="#card-"]') : null;
+      if (!a) return;
+      var card = document.getElementById(a.getAttribute("href").slice(1));
+      if (card && card.hidden) { state.showAllCards = true; applyCardLimit(); }
+    });
+    renderPresets();
+    renderHelper();
+    settingsFromUrl();
     initChat();
     loadCatalog().then(function (cat) {
       state.catalog = cat;

@@ -378,6 +378,230 @@ test("keywords map to settings", function () {
 });
 
 // ------------------------------------------------------------------
+section("Cost options: prompt cache and batch prices");
+test("no options: list prices, no discounts", function () {
+  var e = S.effectivePrices(mk({ input_price_per_mtok: 2, output_price_per_mtok: 8 }));
+  assert.deepStrictEqual(e, { input: 2, output: 8, batch: false, cache: false });
+});
+test("cache share bills that share of input at the cache read price", function () {
+  var m = mk({ input_price_per_mtok: 2, output_price_per_mtok: 8, cache_read_price_per_mtok: 0.2 });
+  var e = S.effectivePrices(m, { cacheShare: 0.5 });
+  close(e.input, 1.1, "input"); assert.ok(e.cache && !e.batch);
+  close(S.monthlyCost(m, 10e6, 1e6, { cacheShare: 0.5 }), 10 * 1.1 + 8, "monthly");
+});
+test("no cache read price: cache share changes nothing", function () {
+  var e = S.effectivePrices(mk({ input_price_per_mtok: 2 }), { cacheShare: 0.75 });
+  assert.strictEqual(e.input, 2); assert.strictEqual(e.cache, false);
+});
+test("cache share is capped at 95%", function () {
+  var m = mk({ input_price_per_mtok: 1, cache_read_price_per_mtok: 0 });
+  close(S.effectivePrices(m, { cacheShare: 1 }).input, 0.05, "capped");
+});
+test("batch prices are used only when listed and not higher than standard", function () {
+  var lower = mk({ input_price_per_mtok: 2, output_price_per_mtok: 8, batch_input_price_per_mtok: 1, batch_output_price_per_mtok: 4 });
+  var higher = mk({ input_price_per_mtok: 0.05, output_price_per_mtok: 0.2, batch_input_price_per_mtok: 0.11, batch_output_price_per_mtok: 0.34 });
+  assert.deepStrictEqual(S.effectivePrices(lower, { useBatch: true }), { input: 1, output: 4, batch: true, cache: false });
+  assert.strictEqual(S.effectivePrices(higher, { useBatch: true }).batch, false);
+  assert.strictEqual(S.effectivePrices(lower, { useBatch: false }).batch, false);
+});
+test("the cache discount is not stacked on a batch price", function () {
+  var m = mk({ input_price_per_mtok: 2, output_price_per_mtok: 8, batch_input_price_per_mtok: 1, batch_output_price_per_mtok: 4, cache_read_price_per_mtok: 0.2 });
+  var e = S.effectivePrices(m, { useBatch: true, cacheShare: 0.5 });
+  assert.strictEqual(e.input, 1); assert.strictEqual(e.cache, false);
+});
+test("unknown list price stays unknown with options on", function () {
+  assert.strictEqual(S.monthlyCost(mk({ input_price_per_mtok: null, price_status: "unverified" }), 1e6, 1e6, { cacheShare: 0.5, useBatch: true }), null);
+});
+test("scoring uses the discounted price and says which discount applied", function () {
+  var base = { input_price_per_mtok: 4, output_price_per_mtok: 16 };
+  var cached = mk(Object.assign({ id: "c", model: "Cached", cache_read_price_per_mtok: 0.4 }, base));
+  var plain = mk(Object.assign({ id: "p", model: "Plain" }, base));
+  var p = profile({ cacheShare: 0.75 });
+  var res = S.rankModels([plain, cached], p, NOW);
+  assert.strictEqual(res.ranked[0].model.id, "c");
+  assert.ok(res.ranked[0].notes.some(function (n) { return /Cached input billed at \$0\.40/.test(n); }));
+  assert.ok(res.ranked[1].notes.some(function (n) { return /No cache read price/.test(n); }));
+  var b = S.rankModels([mk({ batch_input_price_per_mtok: 0.5, batch_output_price_per_mtok: 2 })], profile({ useBatch: true }), NOW).ranked[0];
+  assert.ok(b.notes.some(function (n) { return /Batch price used/.test(n); }));
+});
+test("volume from requests: requests a day times tokens, over 365/12 days", function () {
+  var v = S.volumeFromRequests(1000, 1000, 100);
+  close(v.requests, 1000 * 365 / 12, "requests"); close(v.inputM, 1000 * 365 / 12 * 1000 / 1e6, "in"); close(v.outputM, 1000 * 365 / 12 * 100 / 1e6, "out");
+  assert.deepStrictEqual(S.volumeFromRequests(-5, NaN, "x"), { requests: 0, inputM: 0, outputM: 0 });
+});
+
+section("Capabilities from OpenRouter");
+test("a required capability excludes models listed without it", function () {
+  var no = mk({ id: "no", capabilities: { tools: false, json: true, reasoning: false } });
+  var res = S.rankModels([no, mk({ id: "yes", capabilities: { tools: true, json: true, reasoning: true } })], profile({ needs: { tools: true } }), NOW);
+  assert.deepStrictEqual(res.ranked.map(function (r) { return r.model.id; }), ["yes"]);
+  assert.ok(/tool calling/.test(res.excluded[0].excludeReason));
+});
+test("models with no capability data are kept and flagged, not excluded", function () {
+  var r = S.rankModels([mk({ capabilities: null })], profile({ needs: { json: true, reasoning: true } }), NOW);
+  assert.strictEqual(r.ranked.length, 1);
+  assert.ok(r.ranked[0].flags.some(function (f) { return /JSON output not confirmed/.test(f); }));
+  assert.ok(r.ranked[0].flags.some(function (f) { return /Reasoning mode not confirmed/.test(f); }));
+});
+test("capability needs do not apply to embedding tasks", function () {
+  var emb = mk({ kind: "embedding", task_fit: ["embeddings"], capabilities: null });
+  var r = S.rankModels([emb], profile({ taskType: "embeddings", needs: { tools: true } }), NOW);
+  assert.strictEqual(r.ranked.length, 1); assert.strictEqual(r.ranked[0].flags.length, 0);
+});
+test("every catalog model listed on OpenRouter has capability data", function () {
+  models.filter(function (m) { return m.openrouter_id; }).forEach(function (m) {
+    assert.ok(m.capabilities && typeof m.capabilities.tools === "boolean", m.id + " has no capabilities");
+  });
+});
+test("liveFacts reads capabilities, cache and batch prices, output limit, and dates", function () {
+  var entry = { id: "acme/one", created: 1794253781, expiration_date: "2026-12-11", supported_parameters: ["tools", "response_format", "max_tokens"],
+    pricing: { prompt: "0.000002", completion: "0.00001", input_cache_read: "0.0000002" }, top_provider: { max_completion_tokens: 64000 } };
+  var byId = { "acme/one": entry, "acme/one:batch": { id: "acme/one:batch", pricing: { prompt: "0.000001", completion: "0.000005" } } };
+  var f = S.liveFacts(entry, byId);
+  assert.deepStrictEqual(f.capabilities, { tools: true, json: true, reasoning: false });
+  assert.strictEqual(f.cache_read_price_per_mtok, 0.2);
+  assert.strictEqual(f.batch_input_price_per_mtok, 1); assert.strictEqual(f.batch_output_price_per_mtok, 5);
+  assert.strictEqual(f.max_output_tokens, 64000);
+  assert.strictEqual(f.retires_on, "2026-12-11");
+  assert.strictEqual(f.listed_on, new Date(1794253781 * 1000).toISOString().slice(0, 10));
+});
+test("liveFacts with no parameter list leaves capabilities null; every key is present", function () {
+  var f = S.liveFacts({ id: "x", pricing: { prompt: "0", completion: "0" } }, {});
+  assert.strictEqual(f.capabilities, null);
+  assert.deepStrictEqual(Object.keys(f).sort(), ["batch_input_price_per_mtok", "batch_output_price_per_mtok", "cache_read_price_per_mtok", "capabilities", "listed_on", "max_output_tokens", "retires_on"]);
+});
+test("mergeLive replaces bundled facts with live ones, clearing what live data no longer lists", function () {
+  var cat = [mk({ id: "a", openrouter_id: "acme/a", cache_read_price_per_mtok: 0.1, capabilities: { tools: true, json: true, reasoning: true } })];
+  var live = [{ id: "acme/a", name: "A", context_length: 1000000, supported_parameters: ["response_format"], pricing: { prompt: "0.000001", completion: "0.000004" } }];
+  var m = S.mergeLive(cat, live, NOW).models[0];
+  assert.strictEqual(m.cache_read_price_per_mtok, null);
+  assert.deepStrictEqual(m.capabilities, { tools: false, json: true, reasoning: false });
+  assert.strictEqual(S.validateEntry(m).length, 0, S.validateEntry(m).join("; "));
+});
+test("live-only entries carry capabilities and pass validation", function () {
+  var live = [{ id: "acme/new", name: "Acme: New", context_length: 64000, supported_parameters: ["tools"],
+    architecture: { input_modalities: ["text"], output_modalities: ["text"] }, pricing: { prompt: "0.0000001", completion: "0.0000002" } }];
+  var lo = S.mergeLive([], live, NOW).liveOnly[0];
+  assert.strictEqual(lo.capabilities.tools, true);
+  assert.strictEqual(S.validateEntry(lo).length, 0, S.validateEntry(lo).join("; "));
+});
+
+section("Retirement dates");
+test("future, today, past, and missing retirement dates", function () {
+  var now = new Date("2026-11-13T12:00:00Z");
+  var soon = S.retirement({ retires_on: "2026-12-11" }, now);
+  assert.strictEqual(soon.days, 28); assert.ok(!soon.past && /Scheduled to retire on 2026-12-11 \(in 28 days\)/.test(soon.text));
+  assert.ok(S.retirement({ retires_on: "2026-11-01" }, now).past);
+  assert.strictEqual(S.retirement({}, now), null);
+  assert.strictEqual(S.retirement({ retires_on: "soon" }, now), null);
+});
+test("a retirement date becomes a warning flag and shows in the switch check", function () {
+  var m = mk({ id: "old", retires_on: "2026-11-20" });
+  assert.ok(S.dataFlags(m, NOW).some(function (f) { return f.level === "warn" && /retire/.test(f.text); }));
+  var sc = S.switchCheck([m, mk({ id: "new", input_price_per_mtok: 0.1 })], "old", profile(), NOW);
+  assert.ok(sc.retirement && sc.retirement.days > 0);
+});
+test("validateEntry checks the optional live fields", function () {
+  assert.strictEqual(S.validateEntry(mk({ cache_read_price_per_mtok: 0.1, batch_input_price_per_mtok: 1, batch_output_price_per_mtok: 2, max_output_tokens: 8000,
+    capabilities: { tools: true, json: false, reasoning: true }, retires_on: "2027-01-01" })).length, 0);
+  [{ cache_read_price_per_mtok: -1 }, { batch_input_price_per_mtok: 1 }, { capabilities: { tools: "yes", json: true, reasoning: true } },
+   { capabilities: [] }, { retires_on: "next year" }, { max_output_tokens: "lots" }].forEach(function (bad) {
+    assert.ok(S.validateEntry(mk(bad)).length > 0, "accepted " + JSON.stringify(bad));
+  });
+});
+
+section("Robustness of the top pick");
+test("a runner-up that is matched or beaten on every factor never wins", function () {
+  var res = S.rankModels([mk({ id: "a", input_price_per_mtok: 0.5 }), mk({ id: "b", input_price_per_mtok: 1 })], profile(), NOW);
+  var rb = S.robustness(res);
+  assert.strictEqual(rb.topShare, 1); assert.strictEqual(rb.verdict, "stable");
+  assert.ok(rb.runnerUp.dominated && !rb.runnerUp.twin);
+});
+test("identical models are reported as a tie, not as a stable pick", function () {
+  var res = S.rankModels([mk({ id: "a", model: "A" }), mk({ id: "b", model: "B" })], profile(), NOW);
+  var rb = S.robustness(res);
+  assert.strictEqual(rb.verdict, "tie"); assert.ok(rb.runnerUp.twin);
+});
+test("a real trade-off splits the wins, and the result is repeatable", function () {
+  var cheap = mk({ id: "cheap", quality_tier: 3, input_price_per_mtok: 0.1, output_price_per_mtok: 0.4 });
+  var strong = mk({ id: "strong", quality_tier: 5, input_price_per_mtok: 3, output_price_per_mtok: 12 });
+  var res = S.rankModels([cheap, strong], profile(), NOW);
+  var a = S.robustness(res), b = S.robustness(res);
+  assert.ok(a.topShare > 0 && a.topShare < 1, "topShare " + a.topShare);
+  assert.deepStrictEqual(a.shares.map(function (s) { return s.share; }), b.shares.map(function (s) { return s.share; }));
+  close(a.shares.reduce(function (t, s) { return t + s.share; }, 0), 1, "shares sum");
+  assert.strictEqual(a.samples, 300);
+});
+test("no ranked models: no robustness result", function () {
+  assert.strictEqual(S.robustness({ ranked: [], weights: S.computeWeights(profile()) }), null);
+});
+
+section("Presets and shareable settings");
+test("every preset has a unique id and ranks at least one catalog model", function () {
+  var ids = {};
+  S.PRESETS.forEach(function (pr) {
+    assert.ok(!ids[pr.id], "duplicate " + pr.id); ids[pr.id] = true;
+    assert.ok(pr.name && pr.description, pr.id + " needs a name and a description");
+    var res = S.rankModels(models, S.profileFromSettings(S.presetSettings(pr.id)), NOW);
+    assert.ok(res.ranked.length > 0, pr.id + " ranks nothing");
+  });
+  assert.strictEqual(S.presetSettings("nope"), null);
+});
+test("settings survive a round trip through the link", function () {
+  S.PRESETS.map(function (pr) { return S.presetSettings(pr.id); }).concat([S.DEFAULT_SETTINGS]).forEach(function (s) {
+    var back = S.decodeSettings(S.encodeSettings(s));
+    assert.deepStrictEqual(back.ignored, []);
+    var full = {};
+    Object.keys(S.DEFAULT_SETTINGS).forEach(function (k) { full[k] = k in back.settings ? back.settings[k] : S.DEFAULT_SETTINGS[k]; });
+    assert.deepStrictEqual(full, s);
+  });
+  assert.strictEqual(S.encodeSettings(S.DEFAULT_SETTINGS), "");
+});
+test("the link never carries the task description", function () {
+  var qs = S.encodeSettings(Object.assign({ description: "secret plan" }, S.presetSettings("support")));
+  assert.ok(!/secret|description/.test(qs), qs);
+});
+test("bad link values are skipped and reported, never applied", function () {
+  var d = S.decodeSettings("?task=hack&context=12345&cache=33&budget=-1&in=1e9&out=abc&tools=yes&json=1&zzz=1&quality=frontier&%E0%A4%A=1");
+  assert.deepStrictEqual(d.settings, { json: true, quality: "frontier" });
+  ["task", "context", "cache", "budget", "in", "out", "tools", "zzz"].forEach(function (k) { assert.ok(d.ignored.indexOf(k) >= 0, k + " not reported"); });
+  assert.strictEqual(d.ignored.length, 9);
+});
+test("profileFromSettings converts millions to tokens and collects capability needs", function () {
+  var p = S.profileFromSettings({ inputM: 2.5, outputM: 0, tools: true, cacheShare: 0.5, budget: 0 });
+  assert.strictEqual(p.inputTokens, 2.5e6); assert.strictEqual(p.outputTokens, 0);
+  assert.deepStrictEqual(p.needs, { tools: true, json: false, reasoning: false });
+  assert.strictEqual(p.budget, null); assert.strictEqual(p.cacheShare, 0.5);
+});
+test("description hints now cover tools, JSON, and batch work", function () {
+  var s = S.suggestFromText("An agent that calls tools and returns JSON, run overnight").settings;
+  assert.strictEqual(s.tools, true); assert.strictEqual(s.json, true); assert.strictEqual(s.useBatch, true); assert.strictEqual(s.latency, "any");
+});
+
+section("Catalog refresh tool");
+var refreshTool = require("../tools/refresh_catalog.js");
+test("refresh updates listed figures and leaves editorial fields alone", function () {
+  var cat = { catalog_date: "2026-01-01", stale_after_days: 90, notes: [], models: [
+    mk({ id: "a", openrouter_id: "acme/a", quality_tier: 4, latency_class: "fast", strengths: ["kept"], last_verified: "2026-01-01" }),
+    mk({ id: "gone", openrouter_id: "acme/gone" }), mk({ id: "local", openrouter_id: null, price_status: "self-hosted" })
+  ] };
+  var live = [{ id: "acme/a", context_length: 500000, supported_parameters: ["tools"], pricing: { prompt: "0.000003", completion: "0.000009", input_cache_read: "0.0000003" } }];
+  var r = refreshTool.refresh(cat, live, "2026-11-13");
+  var a = r.catalog.models[0];
+  assert.strictEqual(a.input_price_per_mtok, 3); assert.strictEqual(a.output_price_per_mtok, 9); assert.strictEqual(a.context_window, 500000);
+  assert.strictEqual(a.cache_read_price_per_mtok, 0.3); assert.strictEqual(a.capabilities.tools, true);
+  assert.strictEqual(a.quality_tier, 4); assert.strictEqual(a.latency_class, "fast"); assert.deepStrictEqual(a.strengths, ["kept"]);
+  assert.strictEqual(a.last_verified, "2026-11-13"); assert.ok(/snapshot 2026-11-13/.test(a.source.name));
+  assert.deepStrictEqual(r.missing, ["gone"]); assert.strictEqual(r.updated, 1);
+  assert.strictEqual(r.catalog.models[1].last_verified, cat.models[1].last_verified);
+  assert.strictEqual(r.catalog.catalog_date, "2026-11-13");
+  assert.strictEqual(cat.models[0].input_price_per_mtok, 1, "input catalog was changed in place");
+});
+test("no catalog entry is stale or dated after the catalog itself", function () {
+  var at = new Date(catalog.catalog_date + "T12:00:00Z");
+  models.forEach(function (m) { var st = S.staleStatus(m, at); assert.ok(!st.stale, m.id + ": " + st.reason); });
+});
+
 section("Static checks: paths, copy, secrets");
 var html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
 test("every asset reference in index.html is relative", function () {

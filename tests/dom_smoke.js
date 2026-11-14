@@ -404,6 +404,76 @@ test("streaming: tokens render as they arrive, then the answer is final", functi
   });
 });
 
+test("presets: one click fills every field, marks the button, and puts the settings in the address", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    var btns = p.d.querySelectorAll("#preset-list .preset");
+    ok(btns.length === 7 && !p.$("presets").hidden, "preset buttons: " + btns.length);
+    p.d.querySelector('[data-preset="bulk"]').click();
+    ok(p.$("quality").value === "basic" && p.$("latency").value === "any" && p.$("budget").value === "0.5", "fields not set");
+    ok(p.$("use-batch").checked && p.$("need-json").checked && !p.$("need-tools").checked, "checkboxes not set");
+    ok(/Tag a million product reviews/.test(p.$("task-desc").value), "description not set");
+    ok(p.d.querySelector('[data-preset="bulk"]').getAttribute("aria-pressed") === "true", "not pressed");
+    ok(/batch=1/.test(p.w.location.search) && /json=1/.test(p.w.location.search) && !/Tag/.test(p.w.location.search), "address: " + p.w.location.search);
+    p.$("quality").value = "good"; fire(p, "quality", "input");
+    ok(p.d.querySelector('[data-preset="bulk"]').getAttribute("aria-pressed") === "false", "editing a field should release the preset");
+  });
+});
+
+test("shared link: settings in the address load into the form, and bad ones are named", function () {
+  var p = boot({ url: "http://localhost:8000/model-scout/index.html?task=code&tools=1&cache=50&in=12&zzz=1&context=5" });
+  return settled(p).then(function () {
+    ok(p.$("task-type").value === "code" && p.$("need-tools").checked && p.$("cache-share").value === "0.5" && p.$("vol-in").value === "12", "settings not applied");
+    ok(p.$("context-need").value === "32000", "invalid context should be skipped");
+    ok(/could not read/.test(p.$("share-status").textContent) && /zzz/.test(p.$("share-status").textContent) && /context/.test(p.$("share-status").textContent), "skipped settings not named: " + p.$("share-status").textContent);
+    ok(/with 50% of input cached/.test(p.$("top-pick").textContent), "cost basis missing from the headline");
+  });
+});
+
+test("model cards: the top 6 show, the rest open on request or from a table link", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    var cards = p.d.querySelectorAll("#cards .card"), shown = p.d.querySelectorAll("#cards .card:not([hidden])");
+    ok(cards.length > 6 && shown.length === 6, "shown " + shown.length + " of " + cards.length);
+    var btn = p.$("cards-toggle");
+    ok(!btn.hidden && btn.getAttribute("aria-expanded") === "false" && /Show all/.test(btn.textContent), "toggle state");
+    btn.click();
+    ok(p.d.querySelectorAll("#cards .card:not([hidden])").length === cards.length && btn.getAttribute("aria-expanded") === "true", "toggle did not open all");
+    btn.click();
+    var last = p.d.querySelectorAll("#compare-body tr th a");
+    last = last[last.length - 1];
+    last.click();
+    ok(!p.d.getElementById(last.getAttribute("href").slice(1)).hidden, "table link to a folded card left it hidden");
+  });
+});
+
+test("confidence and capabilities: verdict under the top pick; a required capability excludes models without it", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    var conf = p.$("top-pick").querySelector(".confidence");
+    ok(conf && /Stable pick|Likely pick|Close call|Tie/.test(conf.textContent) && /of 300 reruns|on every factor/.test(conf.textContent), "confidence block: " + (conf && conf.textContent));
+    var before = p.d.querySelectorAll("#compare-body tr").length;
+    p.$("need-reasoning").checked = true; fire(p, "need-reasoning", "change");
+    ok(p.d.querySelectorAll("#compare-body tr").length < before, "requiring reasoning mode excluded nothing");
+    ok(/Does not support reasoning mode/.test(p.$("excluded").textContent), "exclusion reason missing");
+    ok(/Supports tool calling/.test(p.$("cards").textContent), "card capability line missing");
+  });
+});
+
+test("volume helper: requests per day fill the monthly volume fields", function () {
+  var p = boot({});
+  return settled(p).then(function () {
+    ok(p.$("req-apply").disabled, "apply should wait for numbers");
+    p.$("req-day").value = "1000"; fire(p, "req-day");
+    p.$("req-in").value = "2000"; fire(p, "req-in");
+    p.$("req-out").value = "500"; fire(p, "req-out");
+    ok(!p.$("req-apply").disabled && /60\.83 million input/.test(p.$("req-readout").textContent), "readout: " + p.$("req-readout").textContent);
+    ok(p.$("vol-in").value === "50", "fields changed before Use was pressed");
+    p.$("req-apply").click();
+    ok(p.$("vol-in").value === "60.83" && p.$("vol-out").value === "15.21", "fields: " + p.$("vol-in").value + " / " + p.$("vol-out").value);
+  });
+});
+
 (function run(i) {
   if (i >= cases.length) {
     console.log("\n" + results.pass + " passed, " + results.fail + " failed, " + (results.pass + results.fail) + " total");

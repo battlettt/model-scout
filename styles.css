@@ -1,4 +1,4 @@
-/* Model Scout v1. Research instrument panel with editorial polish.
+/* Model Scout v2. Research instrument panel with editorial polish.
    Self-contained: system font stacks only, no external assets, no webfonts.
    Every color is a semantic token defined in the two :root blocks below. */
 :root {
@@ -553,6 +553,76 @@ code { font-family: var(--font-mono); font-size: 0.9em; padding: 0 var(--s1); bo
 footer.site { border-top: 2px solid var(--line-strong); background: var(--surface); padding: var(--s5) 0; font-size: 0.9375rem; color: var(--muted); }
 footer.site p { margin: 0; }
 
+/* ---------- presets, capability chips, cost helpers ---------- */
+[hidden] { display: none !important; }
+.presets { padding-bottom: var(--s4); margin-bottom: var(--s4); border-bottom: 1px dashed var(--line); }
+.presets-label { margin: 0 0 var(--s2); font-family: var(--font-mono); font-size: 0.8125rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.preset-list { display: flex; flex-wrap: wrap; gap: var(--s2); }
+/* phones: one swipeable row instead of four rows of chips */
+@media (max-width: 39.99em) {
+  .preset-list {
+    flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x proximity; overscroll-behavior-x: contain;
+    margin: 0 calc(-1 * var(--s4)); padding: 0 var(--s4) var(--s2); scroll-padding-inline: var(--s4); scrollbar-width: thin;
+  }
+  .preset { flex: none; scroll-snap-align: start; }
+}
+.preset {
+  min-height: 44px; padding: 0 var(--s4); border-radius: 999px; border: 1px solid var(--line); background: var(--bg);
+  font-size: 0.9375rem; font-weight: 600;
+}
+.preset:hover { border-color: var(--line-strong); background: var(--surface); }
+.preset[aria-pressed="true"] { background: var(--text); border-color: var(--text); color: var(--bg); }
+.preset-result { margin: var(--s3) 0 0; font-size: 0.9375rem; }
+.preset-result:empty { display: none; }
+
+.group .caps { margin: var(--s4) 0 0; padding: 0; border: 0; }
+.group .caps legend {
+  display: block; padding: 0; margin: 0 0 var(--s2);
+  font-family: var(--font-sans); font-size: 1rem; font-weight: 650; letter-spacing: 0; text-transform: none;
+}
+.caps-row { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.check.chip {
+  display: inline-flex; align-items: center; gap: 0.4rem; padding: 0 0.75rem 0 0.625rem;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  transition: border-color var(--t-hover) ease, background-color var(--t-hover) ease;
+}
+.check.chip input[type="checkbox"] { margin: 0; width: 1.125rem; height: 1.125rem; }
+.check.chip label { font-weight: 600; font-size: 0.9375rem; }
+.check.chip:hover { border-color: var(--muted); }
+.check.chip:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.caps > small { margin-top: var(--s2); }
+
+.helper-grid { display: grid; grid-template-columns: 1fr; gap: 0 var(--s3); align-items: end; margin-top: var(--s2); }
+@media (min-width: 30em) { .helper-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.group .helper-grid .field, .helper-grid .field { margin: 0 0 var(--s3); }
+.helper-grid .field > label { font-size: 0.875rem; font-weight: 600; }
+.helper-readout { margin: 0 0 var(--s3); color: var(--muted); }
+
+.share-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); margin-top: var(--s3); }
+#share-status { flex: 1 1 16rem; font-size: 0.9375rem; overflow-wrap: anywhere; }
+.cards-more { display: flex; justify-content: center; margin-top: var(--s4); }
+
+/* ---------- confidence: how much the top pick depends on the exact weights ---------- */
+.confidence {
+  max-width: 66ch; margin: var(--s4) 0 0; padding: var(--s3) var(--s4);
+  background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+.conf-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--s1) var(--s3); margin: 0 0 var(--s2); }
+.conf-head .figure-label { margin: 0; }
+.conf-verdict { font-family: var(--font-mono); font-size: 0.875rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.confidence[data-verdict="stable"] .conf-verdict { color: var(--ok); }
+.confidence[data-verdict="likely"] .conf-verdict { color: var(--accent-text); }
+.confidence[data-verdict="close"] .conf-verdict, .confidence[data-verdict="tie"] .conf-verdict { color: var(--warn); }
+.conf-bar { display: flex; gap: 2px; height: 0.625rem; overflow: hidden; border-radius: 2px; background: var(--surface-2); }
+.conf-seg { flex: 0 1 0; min-width: 3px; background: var(--muted); }
+.conf-seg.is-top { background: var(--accent); }
+.conf-legend { list-style: none; display: flex; flex-wrap: wrap; gap: var(--s1) var(--s4); margin: var(--s2) 0 0; padding: 0; font-size: 0.875rem; }
+.conf-legend li { display: inline-flex; align-items: center; gap: var(--s2); min-width: 0; }
+.conf-legend li::before { content: ""; flex: none; width: 0.625rem; height: 0.625rem; border-radius: 2px; background: var(--muted); }
+.conf-legend li.is-top::before { background: var(--accent); }
+.conf-legend li span:last-child { font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--muted); }
+.conf-text { margin: var(--s2) 0 0; font-size: 0.9375rem; }
+
 /* ---------- ranking reveal: plays only when the order changes ---------- */
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 @keyframes settle { from { opacity: 0.4; transform: translateY(4px); } to { opacity: 1; transform: none; } }
@@ -568,7 +638,8 @@ footer.site p { margin: 0; }
 }
 
 @media print {
-  .sections, .toolbar, .skip, #suggest { display: none; }
+  .sections, .toolbar, .skip, #suggest, .presets, .share-row, .cards-more { display: none; }
+  .cards .card[hidden] { display: flex !important; }
   .card-actions, .chat-settings, .chat-form, #side-form { display: none; }
   .panel, .card, .top-pick, .table-wrap { box-shadow: none; }
 }

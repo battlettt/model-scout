@@ -10,6 +10,9 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - Live data where possible (public model endpoints, no keys); bundled catalog fallback, clearly dated.
 - Honesty rule: no invented benchmarks or specs. Unverified specs are flagged, never presented as current.
 - Ask a model (section 3): chat with one model, or one question to two models side by side; "Ask this model" on every card.
+- Presets (seven common cases) and shareable links: the form settings live in the query string (`encodeSettings` / `decodeSettings`); the task description never does.
+- Hard capability constraints (tool calling, JSON output, reasoning mode), prompt-cache share and batch prices in the cost math, retirement dates as warnings.
+- Confidence check on the top pick (`robustness`): 300 seeded reruns with each weight scaled between half and double; reports ties and dominated runners-up.
 
 ## Run
 - Open `index.html` directly, or serve the repo root: `python3 -m http.server 8000`.
@@ -24,7 +27,8 @@ Interactive website that researches LLMs and recommends the right model for a ta
 
 ## Layout
 - `index.html`, `styles.css`, `app.js`, `catalog.json` at the repo root are the whole app (deploy these four).
-- `app.js`: pure engine (weights, scoring, cost, staleness, validation, live merge, switch check) exported for node, then browser UI.
+- `app.js`: pure engine (weights, scoring, cost, staleness, validation, live merge, switch check, robustness, settings links, presets) exported for node, then browser UI.
+- `tools/refresh_catalog.js`: refreshes catalog.json from a saved OpenRouter model list (prices, context, capabilities, cache and batch prices, output limits, dates) and re-embeds it. Never touches editorial fields. Not deployed.
 - `index.html` embeds a copy of `catalog.json` for `file://` use. After editing the catalog run `node tests/sync_embedded_catalog.js`; a test fails if they drift.
 - `AGENTS.md` is a symlink to this file (git mode 120000). Do not replace it with a regular file.
 
@@ -40,6 +44,8 @@ Interactive website that researches LLMs and recommends the right model for a ta
 - Prices are USD per million tokens; null only with `price_status: "unverified"`. Field-level doubts go in `unverified_fields`.
 - `quality_tier` and `latency_class` are editorial, from provider positioning. Never add benchmark numbers.
 - Live data: browser fetches https://openrouter.ai/api/v1/models (no key). On failure, fall back to the bundled catalog and say so.
+- Capabilities come only from OpenRouter's `supported_parameters` (tools; response_format or structured_outputs; reasoning or include_reasoning). Batch prices come from the `:batch` variant and are used only when lower. Unknown stays null and is flagged, never guessed.
+- Refresh: `curl -s https://openrouter.ai/api/v1/models -o /tmp/or.json && node tools/refresh_catalog.js /tmp/or.json` (add `--dry-run` to preview).
 - User-facing copy: no em dashes.
 
 ## Conventions
